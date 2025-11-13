@@ -189,7 +189,7 @@ class StreamlinedTrainer:
         
     def create_callback(self, sys_config):
         """Create training callback with saving and monitoring"""
-        save_freq = max(2048 * 10 // sys_config['num_envs'], 1000)
+        save_freq = max(2048 * 80 // sys_config['num_envs'], 1000)
         
         class TrainingCallback(BaseCallback):
             def __init__(self, save_freq, save_dir, ticker, training_logger):
@@ -203,7 +203,7 @@ class StreamlinedTrainer:
                 
             def _on_step(self) -> bool:
                 # Memory cleanup every 1000 steps
-                if self.n_calls - self.last_memory_check > 1000:
+                if self.n_calls - self.last_memory_check > 10000:
                     memory_pct = psutil.virtual_memory().percent
                     if memory_pct > config.MAX_MEMORY_USAGE_PCT:  # Use config value
                         gc.collect()
