@@ -181,11 +181,11 @@ class TradingEnv(gym.Env):
         elif -0.5 < pct_change < 0.5: # Breakeven zone
             pnl_reward = 0.0
         elif 0.5 <= pct_change < 2.1: 
-            pnl_reward = 0.5         
+            pnl_reward = 0.75         
         elif 2.1 <= pct_change < 4.1: 
-            pnl_reward = 1.0         
+            pnl_reward = 1.5         
         elif pct_change >= 4.1:       
-            pnl_reward = 2.0         
+            pnl_reward = 3.0         
         else:
             pnl_reward = 0.0
 
