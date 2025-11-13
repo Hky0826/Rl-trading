@@ -189,7 +189,7 @@ class StreamlinedTrainer:
         
     def create_callback(self, sys_config):
         """Create training callback with saving and monitoring"""
-        save_freq = max(2048 * 80 // sys_config['num_envs'], 1000)
+        save_freq = max(2048 * 10 // sys_config['num_envs'], 1000)
         
         class TrainingCallback(BaseCallback):
             def __init__(self, save_freq, save_dir, ticker, training_logger):

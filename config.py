@@ -59,7 +59,7 @@ def get_optimal_cpu_count():
     
     # Take the minimum to avoid resource exhaustion
     optimal_count = min(max_envs_by_cpu, max_envs_by_memory, 12)  # Cap at 12
-    optimal_count = 8
+    optimal_count = 16
     return optimal_count
 
 NUM_CPU_TO_USE = get_optimal_cpu_count()
@@ -98,7 +98,7 @@ def get_device_optimized_hyperparams():
         "ent_coef": 0.01,
         "vf_coef": 0.5,
         "max_grad_norm": 0.5,
-        "learning_rate": 1e-6, #initial training rate, 9e-6 
+        "learning_rate": 0.0001, #initial training rate, 9e-6 
         "policy_kwargs": {
             "net_arch": net_arch,
             "activation_fn": torch.nn.ReLU,

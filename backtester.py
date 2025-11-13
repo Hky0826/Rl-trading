@@ -460,6 +460,22 @@ def backtest_worker(model_path, data_path, ticker):
         logger.error(traceback.format_exc())
         return None
 
+def save_best_model_name(model_name: str, file_path: str = "best_model.json"):
+    """
+    Save the best model name to a JSON file.
+    
+    Args:
+        model_name (str): The name or path of the best model.
+        file_path (str): File path for the JSON file (default: 'best_model.json').
+    """
+    data = {"best_model": model_name}
+    
+    try:
+        with open(file_path, "w") as f:
+            json.dump(data, f, indent=4)
+        print(f"✅ Best model name saved to '{file_path}': {model_name}")
+    except Exception as e:
+        print(f"❌ Failed to save best model name: {e}")
 
 def main():
     """Main backtesting function with multiprocessing"""
@@ -485,7 +501,6 @@ def main():
     model_dir = config.RL_MODEL_DIR
     model_paths = [
         p for p in glob.glob(os.path.join(model_dir, "*.zip"))
-        if "final" not in os.path.basename(p).lower()  # Exclude final model
     ]
     
     if not model_paths:
@@ -527,7 +542,7 @@ def main():
     all_results.sort(key=lambda x: x['metrics'].get("Calmar Ratio", -999), reverse=True)
     
     # Save comprehensive results
-    excel_path = save_comprehensive_results(all_results, ticker)
+    #excel_path = save_comprehensive_results(all_results, ticker)
     
     # Display summary
     summary_data = []
@@ -551,6 +566,7 @@ def main():
         best_model_info = results_df.iloc[0]
         best_result = all_results[0]
         
+        save_best_model_name(best_model_info['model_name'])
         print(f"\n🏆 BEST MODEL: {best_model_info['model_name']}")
         print("=" * 80)
         print(f"  📈 Calmar Ratio: {best_model_info['Calmar Ratio']:.2f}")
@@ -567,7 +583,7 @@ def main():
             print(breakdown_report)
         
         print(f"\n💡 ACTION: Consider using '{best_model_info['model_name']}' for live trading")
-        print(f"📁 Results saved to: {excel_path}")
+        #print(f"📁 Results saved to: {excel_path}")
         #print(f"📊 Excel includes: Summary, All Trades, Equity Curves, Risk/RR Breakdowns, Top Performers")
         
         # Plot equity curve for best model
