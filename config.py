@@ -3,7 +3,7 @@
 # =============================================================================
 # pip install stable-baselines3[extra] gymnasium torch pandas pyarrow MetaTrader5 tqdm matplotlib numba Flask Flask-HTTPAuth opencv-python-headless psutil
 
-import MetaTrader5 as mt5
+#import MetaTrader5 as mt5
 import logging
 import psutil
 import torch
@@ -115,8 +115,8 @@ TIMEFRAME_MAP = {
     "M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5, "M15": mt5.TIMEFRAME_M15,
     "M30": mt5.TIMEFRAME_M30, "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4,
 }
-PRIMARY_TIMEFRAME_MT5 = TIMEFRAME_MAP[PRIMARY_TIMEFRAME_STRING]
-TREND_TIMEFRAME_MT5 = TIMEFRAME_MAP[TREND_TIMEFRAME_STRING]
+PRIMARY_TIMEFRAME_MT5 = "M5"
+TREND_TIMEFRAME_MT5 = "M30"
 
 # Calculate candles per day
 minutes_per_candle = 0
