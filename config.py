@@ -59,7 +59,7 @@ def get_optimal_cpu_count():
     
     # Take the minimum to avoid resource exhaustion
     optimal_count = min(max_envs_by_cpu, max_envs_by_memory, 12)  # Cap at 12
-    optimal_count = 16
+    optimal_count = 8
     return optimal_count
 
 NUM_CPU_TO_USE = get_optimal_cpu_count()
