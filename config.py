@@ -7,7 +7,7 @@
 import logging
 import psutil
 import torch
-from stable_baselines3.common.utils import constant_fn
+from stable_baselines3.common.utils import ConstantSchedule
 
 # --- Performance Optimization Settings ---
 ENABLE_TORCH_COMPILE = True  # Use torch.compile for faster inference (PyTorch 2.0+)
@@ -94,7 +94,7 @@ def get_device_optimized_hyperparams():
         "n_epochs": n_epochs,
         "gamma": 0.99,
         "gae_lambda": 0.95,
-        "clip_range": constant_fn(0.1),
+        "clip_range": ConstantSchedule(0.1),
         "ent_coef": 0.01,
         "vf_coef": 0.5,
         "max_grad_norm": 0.5,
