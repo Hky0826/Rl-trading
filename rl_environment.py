@@ -164,8 +164,7 @@ class TradingEnv(gym.Env):
 
     def _calculate_reward(self, total_pnl_closed_this_step=0, action=None):
         pnl_norm = safe_div(total_pnl_closed_this_step, max(self._last_current_equity, 1.0), default=0.0)
-        """pnl_tuning = pnl_norm * 0.92 # To avoid reward hacking via many trades
-        pnl_reward = safe_value(pnl_tuning, default=0.0, clip_min=-1e6, clip_max=1e6)"""
+        return_reward = safe_value(pnl_norm, default=0.0, clip_min=-1e6, clip_max=1e6)
 
         if action is None or len(action) < 3:
             return 0.0
@@ -211,7 +210,7 @@ class TradingEnv(gym.Env):
         else:
             entry_penalty = 0.0
 
-        reward = pnl_reward
+        reward = (pnl_reward * 0.5) + return_reward
         reward = safe_value(reward, default=0.0, clip_min=-1e9, clip_max=1e9)
 
         return reward
