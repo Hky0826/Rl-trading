@@ -167,27 +167,34 @@ class TradingEnv(gym.Env):
         """pnl_tuning = pnl_norm * 0.92 # To avoid reward hacking via many trades
         pnl_reward = safe_value(pnl_tuning, default=0.0, clip_min=-1e6, clip_max=1e6)"""
 
-        if not np.isfinite(self._last_current_equity) or self._last_current_equity <= 0:
-            self._last_current_equity = self.equity
+        if action is None or len(action) < 3:
+            return 0.0
 
-        # ✅ percent change in equity
-        pct_change = (total_pnl_closed_this_step / self._last_current_equity) * 100.0
-        if pct_change <= -2:        # -2% loss or worse
-            pnl_reward = -2.0           # Large penalty
-        elif -2 < pct_change <= -1: # -1% loss
-            pnl_reward = -1.0
-        elif -1 < pct_change <= -0.5: # -0.5% loss
-            pnl_reward = -0.5
-        elif -0.5 < pct_change < 0.5: # Breakeven zone
-            pnl_reward = 0.0
-        elif 0.5 <= pct_change < 2.1: 
-            pnl_reward = 0.75         
-        elif 2.1 <= pct_change < 4.1: 
-            pnl_reward = 1.5         
-        elif pct_change >= 4.1:       
-            pnl_reward = 3.0         
+        try:
+            _, risk_index, rr_profile_index = action
+            risk_index = int(np.clip(int(risk_index), 0, len(config.RISK_LEVELS) - 1))
+            rr_profile_index = int(np.clip(int(rr_profile_index), 0, len(config.RR_PROFILES) - 1))
+        except Exception:
+            return 0.0
+
+        # === Base RR profile scores (customizable) ===
+        # Example: higher RR = higher difficulty = higher score
+        rr_scores = [1.2, 1.3, 1.4, 1.2, 1.3,
+                    1.4, 1.2, 1.3, 1.4, 1.2]
+
+        rr_score = rr_scores[rr_profile_index]
+        risk_multiplier = config.RISK_LEVELS[risk_index]
+
+        # === Determine PnL direction ===
+        if total_pnl_closed_this_step > 0:
+            direction = 1.0   # profitable
+        elif total_pnl_closed_this_step < 0:
+            direction = -1.0  # losing trade
         else:
-            pnl_reward = 0.0
+            direction = 0.0   # no trade closed
+
+        # === Reward composition ===
+        pnl_reward = rr_score * risk_multiplier * direction
 
         current_equity = safe_value(self._last_current_equity, default=self.equity)
         if self.peak_equity <= 0 or np.isnan(self.peak_equity) or np.isinf(self.peak_equity):

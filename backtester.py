@@ -395,7 +395,7 @@ def save_comprehensive_results(all_results, ticker):
         
         # Auto-adjust column widths
         try:
-            wb = load_workbook(excel_file)
+            """wb = load_workbook(excel_file)
             
             for sheet_name in wb.sheetnames:
                 sheet = wb[sheet_name]
@@ -411,7 +411,7 @@ def save_comprehensive_results(all_results, ticker):
                     adjusted_width = min(max_length + 2, 50)
                     sheet.column_dimensions[column_letter].width = adjusted_width
             
-            wb.save(excel_file)
+            wb.save(excel_file)"""
             logger.info("✅ Excel column widths auto-adjusted")
             
         except Exception as e:
@@ -489,7 +489,7 @@ def main():
     ticker = config.TICKERS[0]
     
     # Check for processed data
-    processed_data_path = os.path.join("processed_data", f"{ticker}_processed.parquet")
+    processed_data_path = os.path.join("processed_data", f"{ticker}_processed_test.parquet")
     if not os.path.exists(processed_data_path):
         logger.critical(f"❌ Processed data not found at {processed_data_path}")
         logger.critical("Please run preprocess_data.py first.")

@@ -74,7 +74,7 @@ def get_device_optimized_hyperparams():
         batch_size = 256
         n_steps = 4096
         n_epochs = 10
-        net_arch = {"pi": [128, 128, 64], "vf": [128, 128, 64]}
+        net_arch = {"pi": [256, 256, 128], "vf": [256, 256, 128]}
     else:
         # CPU optimizations - smaller networks and batches
         batch_size = 256
