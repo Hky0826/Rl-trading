@@ -1,36 +1,7 @@
 # File: rl_environment.py
 # Description: Performance-optimized trading environment with FULL feature set
-# 
-# REALISTIC TIMING IMPLEMENTATION:
-# ================================
-# This environment simulates realistic trading timing to match live trading behavior:
-#
-# 1. OBSERVATION CREATION (_next_observation):
-#    - At step N, observation includes candles 0 to N-1 (COMPLETED candles only)
-#    - Agent cannot see the current forming candle (step N)
-#    - This matches live trading where you only see completed historical data
-#
-# 2. ACTION EXECUTION (_execute_action):
-#    - Action is executed using the last completed candle's price/ATR
-#    - Simulates entering a trade on the "next" candle after observation
-#    - Uses current_step-1 for reference prices (last complete candle)
-#
-# 3. POSITION UPDATES (_update_portfolio):
-#    - Checks if SL/TP hit using current candle's price
-#    - CRITICAL: Positions are ONLY closed when SL or TP is hit
-#    - NO other exit conditions (no time-based, no manual, no other triggers)
-#    - This represents the candle where the trade is active
-#
-# 4. STEP FLOW:
-#    Step N:
-#    ├─ Observe: Candles 0 to N-1 (completed)
-#    ├─ Decide: Model makes decision based on historical data
-#    ├─ Execute: Open position using candle N-1 reference prices
-#    ├─ Update: Check candle N for SL/TP hits on existing positions
-#    └─ Move to N+1
-#
-# This ensures NO look-ahead bias and matches live trading execution.
-# =============================================================================
+# Modified to accumulate rewards episode-by-episode instead of returning per-step rewards.
+
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
@@ -120,6 +91,9 @@ class TradingEnv(gym.Env):
         self._last_floating_pnl = 0.0
         self._last_current_equity = config.INITIAL_EQUITY
 
+        # Episode-level reward accumulator (changed behavior)
+        self._episode_reward_sum = 0.0
+
         self.reset()
 
     def reset(self, seed=None, options=None):
@@ -133,6 +107,9 @@ class TradingEnv(gym.Env):
         self.recent_returns.clear()
         self._last_floating_pnl = 0.0
         self._last_current_equity = float(config.INITIAL_EQUITY)
+
+        # Reset episode accumulator
+        self._episode_reward_sum = 0.0
 
         self._just_opened_trade = False
         obs = self._next_observation()
@@ -163,21 +140,27 @@ class TradingEnv(gym.Env):
         return floating_pnl
 
     def _calculate_reward(self, total_pnl_closed_this_step=0, action=None):
+        """
+        Compute the same per-step reward as before. We will accumulate these per-step rewards
+        into an episode-level sum (self._episode_reward_sum) and return the episode reward at
+        the end of the episode (when terminated=True).
+        """
         pnl_norm = safe_div(total_pnl_closed_this_step, max(self._last_current_equity, 1.0), default=0.0)
         return_reward = safe_value(pnl_norm, default=0.0, clip_min=-1e6, clip_max=1e6)
 
         if action is None or len(action) < 3:
-            return 0.0
+            # If action is not provided, return the normalized pnl-based reward only
+            # (keeps behavior reasonable if called without an action)
+            return return_reward
 
         try:
             _, risk_index, rr_profile_index = action
             risk_index = int(np.clip(int(risk_index), 0, len(config.RISK_LEVELS) - 1))
             rr_profile_index = int(np.clip(int(rr_profile_index), 0, len(config.RR_PROFILES) - 1))
         except Exception:
-            return 0.0
+            return return_reward
 
         # === Base RR profile scores (customizable) ===
-        # Example: higher RR = higher difficulty = higher score
         rr_scores = [1.2, 1.3, 1.4, 1.2, 1.3,
                     1.4, 1.2, 1.3, 1.4, 1.2]
 
@@ -210,7 +193,7 @@ class TradingEnv(gym.Env):
         else:
             entry_penalty = 0.0
 
-        reward = pnl_reward
+        reward = pnl_reward + return_reward + drawdown_penalty + exposure_penalty + entry_penalty
         reward = safe_value(reward, default=0.0, clip_min=-1e9, clip_max=1e9)
 
         return reward
@@ -218,7 +201,6 @@ class TradingEnv(gym.Env):
     def _update_portfolio(self):
         """
         Update portfolio by checking if SL or TP hit on existing positions.
-        
         CRITICAL: Positions are ONLY closed when SL or TP is hit.
         No other exit conditions exist (no time-based exits, no manual closes, etc.)
         """
@@ -296,12 +278,6 @@ class TradingEnv(gym.Env):
     def _execute_action(self, action_type, risk_index, rr_profile_index):
         """
         Execute trading action on CURRENT candle (realistic timing).
-        
-        Key behavior:
-        - Observation was created from candles 0 to current_step-1 (completed)
-        - Action is executed on candle at current_step (forming/current candle)
-        - In live trading: you observe completed candles, then execute on next candle
-        - Uses current_step-1 for price data since current_step hasn't fully formed yet
         """
         try:
             action_type = int(action_type)
@@ -318,7 +294,6 @@ class TradingEnv(gym.Env):
         self.consecutive_holds = 0
         
         # Use the last COMPLETED candle for price/ATR reference
-        # In live trading, this is the most recent complete candle
         idx = max(0, min(len(self.close_prices) - 1, int(self.current_step - 1)))
         current_price = safe_value(self.close_prices[idx], default=0.0)
         atr = safe_value(self.atr_values[idx], default=np.nan)
@@ -368,11 +343,6 @@ class TradingEnv(gym.Env):
     def _next_observation(self):
         """
         Create observation from COMPLETED candles only (realistic timing).
-        
-        Key behavior:
-        - At step N, we observe candles 0 to N-1 (completed candles)
-        - This matches live trading where you can only see completed candles
-        - The action taken will be executed on candle N (current/forming candle)
         """
         # Get completed candles up to (but not including) current step
         end = int(self.current_step)
@@ -402,10 +372,12 @@ class TradingEnv(gym.Env):
         return {'market_features': market_features_out.copy()}
 
     def step(self, action):
+        # If equity already <= 0 at the start of step, end episode and return accumulated episode reward + penalty
         if self.equity <= 0:
-            self.current_step += 1
+            terminated = True
+            reward = float(safe_value(self._episode_reward_sum, default=0.0)) + float(config.CONSTRAINT_VIOLATION_PENALTY)
             obs = self._next_observation()
-            return obs, float(config.CONSTRAINT_VIOLATION_PENALTY), True, False, {}
+            return obs, reward, True, False, {}
 
         try:
             action_type, risk_index, rr_profile_index = action
@@ -418,15 +390,28 @@ class TradingEnv(gym.Env):
         terminated = bool(self.current_step >= len(self.df))
 
         pnl_from_closed_trades = self._update_portfolio()
-        reward = self._calculate_reward(total_pnl_closed_this_step=pnl_from_closed_trades, action=action)
 
+        # Calculate the per-step reward but do NOT return it immediately. Instead accumulate it
+        # and only return the episode total when the episode terminates.
+        reward_step = self._calculate_reward(total_pnl_closed_this_step=pnl_from_closed_trades, action=action)
+        # Accumulate
+        self._episode_reward_sum += float(safe_value(reward_step, default=0.0))
+
+        # If we hit invalid equity states, handle and mark termination
         if not np.isfinite(self.equity):
             self.equity = safe_value(self.equity, default=0.0)
         if self.equity <= 0:
             terminated = True
-            reward += float(config.CONSTRAINT_VIOLATION_PENALTY)
+            # apply constraint penalty to episode sum
+            self._episode_reward_sum += float(config.CONSTRAINT_VIOLATION_PENALTY)
+
+        # If episode terminated, return the accumulated episode reward. Otherwise return 0.0
+        if terminated:
+            reward_out = float(safe_value(self._episode_reward_sum, default=0.0))
+        else:
+            reward_out = 0.0
 
         obs = self._next_observation()
         obs['market_features'] = np.nan_to_num(obs['market_features'], nan=0.0, posinf=_MAX_OBS_VALUE, neginf=-_MAX_OBS_VALUE)
 
-        return obs, float(safe_value(reward, default=0.0)), terminated, False, {}
+        return obs, reward_out, terminated, False, {}

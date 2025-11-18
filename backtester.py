@@ -7,7 +7,7 @@ import logging
 import os
 import glob
 import json
-#from openpyxl import load_workbook
+from openpyxl import load_workbook
 from tqdm import tqdm
 from stable_baselines3 import PPO
 import multiprocessing
@@ -395,7 +395,7 @@ def save_comprehensive_results(all_results, ticker):
         
         # Auto-adjust column widths
         try:
-            """wb = load_workbook(excel_file)
+            wb = load_workbook(excel_file)
             
             for sheet_name in wb.sheetnames:
                 sheet = wb[sheet_name]
@@ -411,7 +411,7 @@ def save_comprehensive_results(all_results, ticker):
                     adjusted_width = min(max_length + 2, 50)
                     sheet.column_dimensions[column_letter].width = adjusted_width
             
-            wb.save(excel_file)"""
+            wb.save(excel_file)
             logger.info("✅ Excel column widths auto-adjusted")
             
         except Exception as e:
@@ -489,7 +489,7 @@ def main():
     ticker = config.TICKERS[0]
     
     # Check for processed data
-    processed_data_path = os.path.join("processed_data", f"{ticker}_processed_test.parquet")
+    processed_data_path = os.path.join("processed_data", f"{ticker}_processed.parquet")
     if not os.path.exists(processed_data_path):
         logger.critical(f"❌ Processed data not found at {processed_data_path}")
         logger.critical("Please run preprocess_data.py first.")
@@ -542,7 +542,7 @@ def main():
     all_results.sort(key=lambda x: x['metrics'].get("Calmar Ratio", -999), reverse=True)
     
     # Save comprehensive results
-    #excel_path = save_comprehensive_results(all_results, ticker)
+    excel_path = save_comprehensive_results(all_results, ticker)
     
     # Display summary
     summary_data = []
@@ -587,7 +587,7 @@ def main():
         #print(f"📊 Excel includes: Summary, All Trades, Equity Curves, Risk/RR Breakdowns, Top Performers")
         
         # Plot equity curve for best model
-        """try:     #REMOVE
+        """try:     
             equity_curve = best_result['equity_curve']
             plt.figure(figsize=(14, 7))
             plt.plot(equity_curve['Time'], equity_curve['Equity'], label='Equity Curve', linewidth=2, color='blue')

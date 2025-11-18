@@ -1,9 +1,9 @@
 # File: config_optimized.py
 # Description: Optimized configuration for better performance
 # =============================================================================
-# pip install stable-baselines3[extra] gymnasium torch pandas pyarrow MetaTrader5 tqdm matplotlib numba Flask Flask-HTTPAuth opencv-python-headless psutil
+# pip install stable-baselines3[extra] gymnasium torch pandas pyarrow tqdm matplotlib numba Flask Flask-HTTPAuth opencv-python-headless psutil
 
-#import MetaTrader5 as mt5
+import MetaTrader5 as mt5
 import logging
 import psutil
 import torch
@@ -17,8 +17,8 @@ PERSISTENT_WORKERS = True  # Keep data loaders alive
 
 # --- Instruments and Timeframe ---
 TICKERS = ['EURUSDc']
-START_DATE = "2023-01-01"
-END_DATE = "2025-08-01"
+START_DATE = "2025-01-01"
+END_DATE = "2025-10-30"
 
 # --- Live Trading Configuration ---
 MAGIC_NUMBER = 123456
@@ -40,8 +40,8 @@ REPLAY_BUFFER_FILE = "replay_buffer.joblib"
 INDICATOR_LOOKBACK_CANDLES = 300 
 
 # Training settings optimized for speed
-INITIAL_TRAINING_TIMESTEPS = 5_000_000  # Reduced for faster initial training
-CONTINUOUS_TRAINING_TIMESTEPS = 5_000_000  # Smaller incremental training
+INITIAL_TRAINING_TIMESTEPS = 5_000_000#5_000_000  # Reduced for faster initial training
+CONTINUOUS_TRAINING_TIMESTEPS = 5_000_000#5_000_000  # Smaller incremental training
 RL_LOOKBACK_WINDOW = 48  # Reduced from 60 for faster processing
 INITIAL_EQUITY = 200.00
 
@@ -74,19 +74,20 @@ def get_device_optimized_hyperparams():
         batch_size = 256
         n_steps = 4096
         n_epochs = 10
-        net_arch = {"pi": [256, 256, 128], "vf": [256, 256, 128]}
+        net_arch = {"pi": [128, 128, 64], "vf": [128, 128, 64]}
     else:
         # CPU optimizations - smaller networks and batches
+                # GPU optimizations
+        batch_size = 1024
+        n_steps = 4096
+        n_epochs = 8
+        net_arch = {"pi": [256, 256, 128], "vf": [256, 256, 128]}
+
+    """# CPU optimizations - smaller networks and batches
         batch_size = 256
         n_steps = 4096
         n_epochs = 8
-        net_arch = {"pi": [128, 128, 64], "vf": [128, 128, 64]}
-
-    """# CPU optimizations - smaller networks and batches
-        batch_size = 128
-        n_steps = 2048
-        n_epochs = 8
-        net_arch = {"pi": [64, 64], "vf": [64, 64]}"""
+        net_arch = {"pi": [128, 128, 64], "vf": [128, 128, 64]}"""
     
     return {
         "n_steps": n_steps,
@@ -111,8 +112,12 @@ PPO_HYPERPARAMS = get_device_optimized_hyperparams()
 # --- Timeframe Configuration ---
 PRIMARY_TIMEFRAME_STRING = "M5"
 TREND_TIMEFRAME_STRING = "M30"
-PRIMARY_TIMEFRAME_MT5 = "M5"
-TREND_TIMEFRAME_MT5 = "M30"
+TIMEFRAME_MAP = {
+    "M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5, "M15": mt5.TIMEFRAME_M15,
+    "M30": mt5.TIMEFRAME_M30, "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4,
+}
+PRIMARY_TIMEFRAME_MT5 = TIMEFRAME_MAP[PRIMARY_TIMEFRAME_STRING]
+TREND_TIMEFRAME_MT5 = TIMEFRAME_MAP[TREND_TIMEFRAME_STRING]
 
 # Calculate candles per day
 minutes_per_candle = 0

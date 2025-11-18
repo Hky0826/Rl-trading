@@ -375,7 +375,6 @@ def validate_feature_set(df):
     logging.info(f"✓ All {len(required_features)} features validated successfully")
     return True
 
-
 def main():
     """Test the data handler"""
     ticker = "EURUSDc"
