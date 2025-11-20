@@ -61,54 +61,6 @@ def run_rl_backtest_with_tracking(data_df, model, ticker, model_name=""):
             positions_after_ids = [id(p) for p in env.open_positions]
             closed_positions = [p for p in positions_before if id(p) not in positions_after_ids]
             
-            if closed_positions and pnl != 0:
-                current_idx = max(0, min(len(env.close_prices) - 1, int(env.current_step - 1)))
-                candle_high = env.df['High'].iloc[current_idx]
-                candle_low  = env.df['Low'].iloc[current_idx]
-                current_time = data_df.index[current_idx]
-
-                for pos in closed_positions:
-                    entry_price = pos['price']
-                    sl = pos['sl']
-                    tp = pos['tp']
-                    size = pos['size']
-                    pos_type = pos['type']
-
-                    if pos_type == 'LONG':
-                        # If candle touches both SL and TP, SL first
-                        if candle_low <= sl and candle_high >= tp:
-                            exit_price = sl
-                            exit_reason = 'SL'
-                        elif candle_low <= sl:
-                            exit_price = sl
-                            exit_reason = 'SL'
-                        elif candle_high >= tp:
-                            exit_price = tp
-                            exit_reason = 'TP'
-                        else:
-                            continue  # Should not happen
-
-                        trade_pnl = (exit_price - entry_price) * size
-
-                    else:  # SHORT
-                        # If both levels touched, SL first (worst)
-                        if candle_high >= sl and candle_low <= tp:
-                            exit_price = sl
-                            exit_reason = 'SL'
-                        elif candle_high >= sl:
-                            exit_price = sl
-                            exit_reason = 'SL'
-                        elif candle_low <= tp:
-                            exit_price = tp
-                            exit_reason = 'TP'
-                        else:
-                            continue  # Should not happen
-
-                        trade_pnl = (entry_price - exit_price) * size
-
-                    trade_pnl = safe_value(trade_pnl)
-                    position_value = entry_price * size
-                    pnl_percent = (trade_pnl / env.equity) if position_value > 0 else 0
 
                     detailed_trades.append({
                         'type': pos_type,

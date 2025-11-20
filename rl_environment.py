@@ -1,36 +1,3 @@
-# File: rl_environment.py
-# Description: Performance-optimized trading environment with FULL feature set
-# 
-# REALISTIC TIMING IMPLEMENTATION:
-# ================================
-# This environment simulates realistic trading timing to match live trading behavior:
-#
-# 1. OBSERVATION CREATION (_next_observation):
-#    - At step N, observation includes candles 0 to N-1 (COMPLETED candles only)
-#    - Agent cannot see the current forming candle (step N)
-#    - This matches live trading where you only see completed historical data
-#
-# 2. ACTION EXECUTION (_execute_action):
-#    - Action is executed using the last completed candle's price/ATR
-#    - Simulates entering a trade on the "next" candle after observation
-#    - Uses current_step-1 for reference prices (last complete candle)
-#
-# 3. POSITION UPDATES (_update_portfolio):
-#    - Checks if SL/TP hit using current candle's price
-#    - CRITICAL: Positions are ONLY closed when SL or TP is hit
-#    - NO other exit conditions (no time-based, no manual, no other triggers)
-#    - This represents the candle where the trade is active
-#
-# 4. STEP FLOW:
-#    Step N:
-#    ├─ Observe: Candles 0 to N-1 (completed)
-#    ├─ Decide: Model makes decision based on historical data
-#    ├─ Execute: Open position using candle N-1 reference prices
-#    ├─ Update: Check candle N for SL/TP hits on existing positions
-#    └─ Move to N+1
-#
-# This ensures NO look-ahead bias and matches live trading execution.
-# =============================================================================
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
@@ -38,6 +5,7 @@ import pandas as pd
 from collections import deque
 import config
 import logging
+import math
 
 _logger = logging.getLogger(__name__)
 
@@ -49,6 +17,8 @@ _MAX_OBS_VALUE = 1e9
 
 def safe_div(numer, denom, default=0.0):
     """Safe division that avoids divide-by-zero and NaN/Inf results."""
+    if numer == 0:
+        return 0.0
     try:
         denom_safe = denom if denom is not None else 0.0
         if denom_safe == 0 or np.isnan(denom_safe) or np.isinf(denom_safe):
@@ -91,6 +61,9 @@ class TradingEnv(gym.Env):
 
         # Pre-compute and cache arrays for better performance
         self.features_array = self.df[self.feature_columns].astype(np.float64).values
+        self.open_prices = self.df['Open'].astype(np.float64).values
+        self.high_prices = self.df['High'].astype(np.float64).values
+        self.low_prices = self.df['Low'].astype(np.float64).values
         self.close_prices = self.df['Close'].astype(np.float64).values
         self.atr_values = self.df['ATR'].astype(np.float64).values
 
@@ -117,6 +90,11 @@ class TradingEnv(gym.Env):
         self.action_usage_counts = {}
         self.recent_returns = deque(maxlen=self.lookback_window)
 
+        # Efficient tracking for MORL rewards
+        self.win_history = deque(maxlen=config.REWARD_METRIC_WINDOW)
+        self.rr_history = deque(maxlen=config.REWARD_METRIC_WINDOW)
+        self.risk_history = deque(maxlen=config.REWARD_METRIC_WINDOW)
+
         self._last_floating_pnl = 0.0
         self._last_current_equity = config.INITIAL_EQUITY
 
@@ -133,6 +111,11 @@ class TradingEnv(gym.Env):
         self.recent_returns.clear()
         self._last_floating_pnl = 0.0
         self._last_current_equity = float(config.INITIAL_EQUITY)
+        
+        # Clear histories on reset
+        self.win_history.clear()
+        self.rr_history.clear()
+        self.risk_history.clear()
 
         self._just_opened_trade = False
         obs = self._next_observation()
@@ -162,58 +145,53 @@ class TradingEnv(gym.Env):
         self._last_floating_pnl = floating_pnl
         return floating_pnl
 
-    def _calculate_reward(self, total_pnl_closed_this_step=0, action=None):
+    def _calculate_reward(self, total_pnl_closed_this_step=0, num_closed_trades=0, action=None):
+        """
+        Scalarization-Based MORL Reward Calculation.
+        Combines multiple objectives into a single scalar using adjustable weights.
+        """
+        # 1. PnL Component (Normalized)
         pnl_norm = safe_div(total_pnl_closed_this_step, max(self._last_current_equity, 1.0), default=0.0)
-        return_reward = safe_value(pnl_norm, default=0.0, clip_min=-1e6, clip_max=1e6)
+        r_pnl = safe_value(pnl_norm, default=0.0, clip_min=-1.0, clip_max=1.0)
 
-        if action is None or len(action) < 3:
-            return 0.0
-
-        try:
-            _, risk_index, rr_profile_index = action
-            risk_index = int(np.clip(int(risk_index), 0, len(config.RISK_LEVELS) - 1))
-            rr_profile_index = int(np.clip(int(rr_profile_index), 0, len(config.RR_PROFILES) - 1))
-        except Exception:
-            return 0.0
-
-        # === Base RR profile scores (customizable) ===
-        # Example: higher RR = higher difficulty = higher score
-        rr_scores = [1.2, 1.3, 1.4, 1.2, 1.3,
-                    1.4, 1.2, 1.3, 1.4, 1.2]
-
-        rr_score = rr_scores[rr_profile_index]
-        risk_multiplier = config.RISK_LEVELS[risk_index]
-
-        # === Determine PnL direction ===
-        if total_pnl_closed_this_step > 0:
-            direction = 1.0   # profitable
-        elif total_pnl_closed_this_step < 0:
-            direction = -1.0  # losing trade
-        else:
-            direction = 0.0   # no trade closed
-
-        # === Reward composition ===
-        pnl_reward = rr_score * risk_multiplier * direction
-
+        # 2. Drawdown Component (Continuous)
         current_equity = safe_value(self._last_current_equity, default=self.equity)
-        if self.peak_equity <= 0 or np.isnan(self.peak_equity) or np.isinf(self.peak_equity):
+        if self.peak_equity <= 0:
             drawdown = 0.0
         else:
             drawdown = max(0.0, safe_div((self.peak_equity - current_equity), self.peak_equity, default=0.0))
-        drawdown_penalty = -(drawdown ** 2) * 0.18 #config.DRAWDOWN_PENALTY_SCALAR
+        r_drawdown = -(drawdown ** 2) # Penalty
 
-        exposure_penalty = -0.001 * len(self.open_positions)
+        # 3. Metrics Components (Only applied when trades close to avoid living bonus)
+        r_winrate = 0.0
+        r_avg_rr = 0.0
+        r_avg_risk = 0.0
 
-        if getattr(self, "_just_opened_trade", False):
-            entry_penalty = -0.0009
-            self._just_opened_trade = False
-        else:
-            entry_penalty = 0.0
+        if num_closed_trades > 0:
+            # Win Rate
+            if len(self.win_history) > 0:
+                r_winrate = sum(self.win_history) / len(self.win_history)
+            
+            # Average R:R
+            if len(self.rr_history) > 0:
+                r_avg_rr = sum(self.rr_history) / len(self.rr_history)
+            
+            # Average Risk
+            if len(self.risk_history) > 0:
+                r_avg_risk = sum(self.risk_history) / len(self.risk_history)
 
-        reward = pnl_reward
-        reward = safe_value(reward, default=0.0, clip_min=-1e9, clip_max=1e9)
+        # Combine with Weights
+        weights = config.REWARD_WEIGHTS
+        
+        reward = (
+            weights['pnl'] * r_pnl +
+            weights['drawdown'] * r_drawdown +
+            weights['winrate'] * r_winrate +
+            weights['avg_rr'] * r_avg_rr +
+            weights['avg_risk'] * r_avg_risk
+        )
 
-        return reward
+        return safe_value(reward, default=0.0, clip_min=-1e9, clip_max=1e9)
 
     def _update_portfolio(self):
         """
@@ -223,7 +201,7 @@ class TradingEnv(gym.Env):
         No other exit conditions exist (no time-based exits, no manual closes, etc.)
         """
         if not self.open_positions:
-            return 0.0
+            return 0.0, 0
 
         total_pnl = 0.0
         positions_to_close = []
@@ -242,9 +220,12 @@ class TradingEnv(gym.Env):
                 continue
 
             # Check ONLY for SL/TP hits - no other exit conditions
+            # Data is assumed to be BID prices
+            
             if position.get('type') == 'LONG':
-                # Check SL hit (price dropped to/below SL)
-                if not np.isnan(sl) and current_price <= sl + _EPS:
+                # Long Exit: Sell at Bid
+                # Check SL hit (Bid <= SL)
+                if not np.isnan(sl) and self.low_prices[idx] <= sl + _EPS:
                     close_price = sl
                     pnl = (close_price - price) * size
                     total_pnl += pnl
@@ -252,8 +233,8 @@ class TradingEnv(gym.Env):
                     denom = price * size
                     pct = safe_div(pnl, denom, default=0.0)
                     self.recent_returns.append(safe_value(pct))
-                # Check TP hit (price rose to/above TP)
-                elif not np.isnan(tp) and current_price >= tp - _EPS:
+                # Check TP hit (Bid >= TP)
+                elif not np.isnan(tp) and self.high_prices[idx] >= tp - _EPS:
                     close_price = tp
                     pnl = (close_price - price) * size
                     total_pnl += pnl
@@ -261,11 +242,18 @@ class TradingEnv(gym.Env):
                     denom = price * size
                     pct = safe_div(pnl, denom, default=0.0)
                     self.recent_returns.append(safe_value(pct))
-                # Otherwise, position remains open
                 
             else:  # SHORT
-                # Check SL hit (price rose to/above SL)
-                if not np.isnan(sl) and current_price >= sl - _EPS:
+                # Short Exit: Buy at Ask (Bid + Spread)
+                # Ask High = High + Spread
+                # Ask Low = Low + Spread
+                
+                spread_cost = config.SPREAD_PIPS * config.PIP_VALUE
+                ask_high = self.high_prices[idx] + spread_cost
+                ask_low = self.low_prices[idx] + spread_cost
+                
+                # Check SL hit (Ask >= SL) -> (High + Spread >= SL)
+                if not np.isnan(sl) and ask_high >= sl - _EPS:
                     close_price = sl
                     pnl = (price - close_price) * size
                     total_pnl += pnl
@@ -273,8 +261,8 @@ class TradingEnv(gym.Env):
                     denom = price * size
                     pct = safe_div(pnl, denom, default=0.0)
                     self.recent_returns.append(safe_value(pct))
-                # Check TP hit (price dropped to/below TP)
-                elif not np.isnan(tp) and current_price <= tp + _EPS:
+                # Check TP hit (Ask <= TP) -> (Low + Spread <= TP)
+                elif not np.isnan(tp) and ask_low <= tp + _EPS:
                     close_price = tp
                     pnl = (price - close_price) * size
                     total_pnl += pnl
@@ -282,16 +270,44 @@ class TradingEnv(gym.Env):
                     denom = price * size
                     pct = safe_div(pnl, denom, default=0.0)
                     self.recent_returns.append(safe_value(pct))
-                # Otherwise, position remains open
 
         total_pnl = float(np.clip(total_pnl, -_MAX_PNL, _MAX_PNL))
 
         # Only remove positions that hit SL or TP
-        if abs(total_pnl) > 0:
+        if positions_to_close:
             self.equity = float(np.clip(self.equity + total_pnl, -_MAX_PNL, _MAX_PNL))
             self.open_positions = [p for p in self.open_positions if p not in positions_to_close]
+            
+            # Update MORL metrics
+            for p in positions_to_close:
+                # Win/Loss Logic
+                p_type = p.get('type')
+                p_tp = safe_value(p.get('tp', 0.0))
+                
+                is_win = 0.0
+                if p_type == 'LONG':
+                    if not np.isnan(p_tp) and current_price >= p_tp - _EPS:
+                        is_win = 1.0
+                else: # SHORT
+                    if not np.isnan(p_tp) and current_price <= p_tp + _EPS:
+                        is_win = 1.0
+                
+                self.win_history.append(is_win)
+                
+                # R:R
+                rr_idx = int(p.get('rr_profile_index', 0))
+                if 0 <= rr_idx < len(config.RR_PROFILES):
+                    sl_mult, tp_mult = config.RR_PROFILES[rr_idx]
+                    rr_val = safe_div(tp_mult, sl_mult, default=0.0)
+                    self.rr_history.append(rr_val)
+                
+                # Risk
+                risk_idx = int(p.get('risk_level', 0))
+                if 0 <= risk_idx < len(config.RISK_LEVELS):
+                    risk_val = config.RISK_LEVELS[risk_idx]
+                    self.risk_history.append(risk_val)
 
-        return total_pnl
+        return total_pnl, len(positions_to_close)
 
     def _execute_action(self, action_type, risk_index, rr_profile_index):
         """
@@ -317,11 +333,16 @@ class TradingEnv(gym.Env):
 
         self.consecutive_holds = 0
         
-        # Use the last COMPLETED candle for price/ATR reference
-        # In live trading, this is the most recent complete candle
-        idx = max(0, min(len(self.close_prices) - 1, int(self.current_step - 1)))
-        current_price = safe_value(self.close_prices[idx], default=0.0)
-        atr = safe_value(self.atr_values[idx], default=np.nan)
+        # Use the last COMPLETED candle for ATR reference (prediction)
+        # But execute on the CURRENT candle Open (execution)
+        idx_prev = max(0, min(len(self.close_prices) - 1, int(self.current_step - 1)))
+        idx_curr = max(0, min(len(self.open_prices) - 1, int(self.current_step)))
+        
+        # Execution Price is OPEN of current candle
+        current_open_price = safe_value(self.open_prices[idx_curr], default=0.0)
+        
+        # ATR from previous candle (for SL/TP distance)
+        atr = safe_value(self.atr_values[idx_prev], default=np.nan)
 
         if np.isnan(atr) or atr <= 0:
             return
@@ -334,36 +355,62 @@ class TradingEnv(gym.Env):
         )
 
         sl_multiplier, tp_multiplier = config.RR_PROFILES[rr_profile_index]
+        spread_val = config.SPREAD_PIPS * config.PIP_VALUE
 
-        if action_type == 1:
-            sl = current_price - (atr * sl_multiplier)
-            tp = current_price + (atr * tp_multiplier)
+        if action_type == 1: # LONG
+            # Buy at Ask = Open + Spread
+            entry_price = current_open_price + spread_val
+            
+            # SL/TP based on Entry Price (or pattern? usually based on entry)
+            sl = entry_price - (atr * sl_multiplier)
+            tp = entry_price + (atr * tp_multiplier)
             pos_type = 'LONG'
-        else:
-            sl = current_price + (atr * sl_multiplier)
-            tp = current_price - (atr * tp_multiplier)
+            
+        else: # SHORT
+            # Sell at Bid = Open
+            entry_price = current_open_price
+            
+            sl = entry_price + (atr * sl_multiplier)
+            tp = entry_price - (atr * tp_multiplier)
             pos_type = 'SHORT'
 
-        stop_distance = abs(current_price - sl)
+        stop_distance = abs(entry_price - sl)
         stop_distance = max(stop_distance, _EPS)
 
         if stop_distance > 0 and self.equity > 0:
-            raw_size = (self.equity * (risk_percent / 100.0)) / stop_distance
-            size = safe_value(raw_size, default=0.0, clip_min=0.0, clip_max=_MAX_POSITION_SIZE)
+            # Lot Size Calculation
+            risk_amount = self.equity * (risk_percent / 100.0)
+            
+            # Standard Forex Lot Calculation:
+            # Risk = (Entry - SL) * Lots * Standard_Lot_Size
+            # Lots = Risk / ((Entry - SL) * Standard_Lot_Size)
+            
+            raw_lots = risk_amount / (stop_distance * config.STANDARD_LOT_SIZE)
+            
+            # Round to Lot Step (0.01)
+            lots = math.floor(raw_lots / config.LOT_STEP) * config.LOT_STEP
+            lots = max(lots, config.MIN_LOT_SIZE)
+            
+            # Convert back to units for PnL calculation
+            size = lots * config.STANDARD_LOT_SIZE
+            
+            size = safe_value(size, default=0.0, clip_min=0.0, clip_max=_MAX_POSITION_SIZE)
+            
             if size > 0 and np.isfinite(size):
                 new_position = {
                     'type': pos_type,
-                    'price': float(current_price),
+                    'price': float(entry_price),
                     'sl': float(sl),
                     'tp': float(tp),
                     'size': float(size),
+                    'lots': float(lots),
                     'risk_level': int(risk_index),
                     'rr_profile_index': int(rr_profile_index)
                 }
                 self.open_positions.append(new_position)
                 self._just_opened_trade = True
             else:
-                _logger.debug("Rejected position due to invalid size: %s (raw_size=%s)", size, raw_size)
+                _logger.debug("Rejected position due to invalid size: %s (raw_lots=%s)", size, raw_lots)
 
     def _next_observation(self):
         """
@@ -417,8 +464,8 @@ class TradingEnv(gym.Env):
         self.current_step += 1
         terminated = bool(self.current_step >= len(self.df))
 
-        pnl_from_closed_trades = self._update_portfolio()
-        reward = self._calculate_reward(total_pnl_closed_this_step=pnl_from_closed_trades, action=action)
+        pnl_from_closed_trades, num_closed = self._update_portfolio()
+        reward = self._calculate_reward(total_pnl_closed_this_step=pnl_from_closed_trades, num_closed_trades=num_closed, action=action)
 
         if not np.isfinite(self.equity):
             self.equity = safe_value(self.equity, default=0.0)

@@ -32,6 +32,12 @@ MIN_LOT_SIZE = 0.01
 MAX_DRAWDOWN_PERCENT = 100.0
 MAX_VALIDATION_DRAWDOWN_PERCENT = 80.0
 
+# --- Execution Configuration ---
+SPREAD_PIPS = 2.5
+PIP_VALUE = 0.0001  # Standard for most majors like EURUSD
+STANDARD_LOT_SIZE = 100000
+LOT_STEP = 0.01
+
 # --- Optimized RL Configuration ---
 RL_MODEL_DIR = "rl_models"
 TRADE_LOG_DIR = "trade_logs"
@@ -40,9 +46,9 @@ REPLAY_BUFFER_FILE = "replay_buffer.joblib"
 INDICATOR_LOOKBACK_CANDLES = 300 
 
 # Training settings optimized for speed
-INITIAL_TRAINING_TIMESTEPS = 5_000_000#5_000_000  # Reduced for faster initial training
-CONTINUOUS_TRAINING_TIMESTEPS = 5_000_000#5_000_000  # Smaller incremental training
-RL_LOOKBACK_WINDOW = 48  # Reduced from 60 for faster processing
+INITIAL_TRAINING_TIMESTEPS = 5_000_000
+CONTINUOUS_TRAINING_TIMESTEPS = 5_000_000
+RL_LOOKBACK_WINDOW = 48
 INITIAL_EQUITY = 200.00
 
 # Dynamic CPU usage based on system resources
@@ -77,17 +83,10 @@ def get_device_optimized_hyperparams():
         net_arch = {"pi": [128, 128, 64], "vf": [128, 128, 64]}
     else:
         # CPU optimizations - smaller networks and batches
-                # GPU optimizations
         batch_size = 1024
         n_steps = 4096
         n_epochs = 8
         net_arch = {"pi": [256, 256, 128], "vf": [256, 256, 128]}
-
-    """# CPU optimizations - smaller networks and batches
-        batch_size = 256
-        n_steps = 4096
-        n_epochs = 8
-        net_arch = {"pi": [128, 128, 64], "vf": [128, 128, 64]}"""
     
     return {
         "n_steps": n_steps,
@@ -99,7 +98,7 @@ def get_device_optimized_hyperparams():
         "ent_coef": 0.01,
         "vf_coef": 0.5,
         "max_grad_norm": 0.5,
-        "learning_rate": 0.0001, #initial training rate, 9e-6 
+        "learning_rate": 0.0001, 
         "policy_kwargs": {
             "net_arch": net_arch,
             "activation_fn": torch.nn.ReLU,
@@ -131,19 +130,29 @@ else:
     CANDLES_PER_DAY = 288
 
 # --- Simplified Reward Function Configuration ---
+# Scalarization-Based MORL Weights
+REWARD_WEIGHTS = {
+    'pnl': 1.0,
+    'drawdown': 0.5,
+    'winrate': 0.1,
+    'avg_rr': 0.1,
+    'avg_risk': 0.1
+}
+REWARD_METRIC_WINDOW = 100  # Rolling window for winrate, avg_rr, avg_risk
+
 # Reduced complexity for faster computation
-DRAWDOWN_PENALTY_SCALAR = 0.1  # Increased impact
+DRAWDOWN_PENALTY_SCALAR = 0.1
 ACTION_NOVELTY_SCALAR = 0.001
-TRADE_QUALITY_REWARD_SCALER = 0.0  # Disabled for speed
-CVAR_WINDOW = 24  # Reduced window size
+TRADE_QUALITY_REWARD_SCALER = 0.0
+CVAR_WINDOW = 24
 CVAR_ALPHA = 0.05
-CVAR_PENALTY_SCALAR = 0.0  # Disabled for speed
+CVAR_PENALTY_SCALAR = 0.0
 
 # Simplified frequency targeting
 TARGET_TRADE_FREQUENCY_UPPER_RANGE = 0.10
 TARGET_TRADE_FREQUENCY_LOWER_RANGE = 0.05
-FREQUENCY_PENALTY_SCALAR = 0.0  # Disabled for speed
-ACTIVITY_MEMORY_WINDOW = 864  # Reduced from 864
+FREQUENCY_PENALTY_SCALAR = 0.0
+ACTIVITY_MEMORY_WINDOW = 864
 
 # --- Technical Analysis Configuration ---
 M5_ATR_PERIOD = 14
@@ -153,7 +162,7 @@ MA_FAST_PERIOD = 12
 MA_SLOW_PERIOD = 26
 MACD_SIGNAL_PERIOD = 9
 H1_EMA_PERIOD = 50
-NORMALIZATION_WINDOW = 50  # Reduced from 100 for speed
+NORMALIZATION_WINDOW = 50
 STOCH_K_PERIOD = 14
 STOCH_D_PERIOD = 3
 
@@ -169,15 +178,15 @@ RR_PROFILES = [
 MAX_DRAWDOWN = 0.50
 MIN_TRADE_FREQUENCY = 0.05
 MAX_TRADE_FREQUENCY = 0.20
-CONSTRAINT_VIOLATION_PENALTY = -10.0  # Reduced penalty magnitude
+CONSTRAINT_VIOLATION_PENALTY = -10.0
 
 # Power Save Mode
-POWER_SAVE_MODE = True
+POWER_SAVE_MODE = False
 QUIET_HOURS = [(22, 23), (12, 13)]
 
 # --- Memory Management Settings ---
-TORCH_MEMORY_CLEANUP_INTERVAL = 1000  # Steps between memory cleanup
-MAX_MEMORY_USAGE_PCT = 85  # Maximum memory usage before cleanup
+TORCH_MEMORY_CLEANUP_INTERVAL = 1000
+MAX_MEMORY_USAGE_PCT = 85
 
 # --- Data Processing Optimizations ---
 USE_NUMBA_ACCELERATION = True
