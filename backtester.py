@@ -43,6 +43,7 @@ def run_rl_backtest_with_tracking(data_df, model, ticker, model_name=""):
     - Realistic timing (observe completed candles, execute on next)
     - Detailed trade capture via monkey-patching
     - Comprehensive equity tracking
+    - MT5 lot-based position sizing
     """
     try:
         # Create environment
@@ -53,14 +54,66 @@ def run_rl_backtest_with_tracking(data_df, model, ticker, model_name=""):
         original_update = env._update_portfolio
         
         def tracked_update():
-            """Intercept position updates to capture trade details"""
+            """Intercept position updates to capture trade details with lot-based system"""
             positions_before = [p.copy() for p in env.open_positions]
-            pnl = original_update()
+            pnl, num_closed = original_update()
             
             # Find closed positions
             positions_after_ids = [id(p) for p in env.open_positions]
             closed_positions = [p for p in positions_before if id(p) not in positions_after_ids]
             
+            if closed_positions and pnl != 0:
+                current_idx = max(0, min(len(env.close_prices) - 1, int(env.current_step - 1)))
+                candle_high = env.df['High'].iloc[current_idx]
+                candle_low  = env.df['Low'].iloc[current_idx]
+                current_time = data_df.index[current_idx]
+                
+                contract_size = getattr(config, 'CONTRACT_SIZE', 100000)
+
+                for pos in closed_positions:
+                    entry_price = pos['price']
+                    sl = pos['sl']
+                    tp = pos['tp']
+                    lot_size = pos['lot_size']  # Now using lot_size instead of size
+                    pos_type = pos['type']
+
+                    if pos_type == 'LONG':
+                        # If candle touches both SL and TP, SL first
+                        if candle_low <= sl and candle_high >= tp:
+                            exit_price = sl
+                            exit_reason = 'SL'
+                        elif candle_low <= sl:
+                            exit_price = sl
+                            exit_reason = 'SL'
+                        elif candle_high >= tp:
+                            exit_price = tp
+                            exit_reason = 'TP'
+                        else:
+                            continue  # Should not happen
+
+                        # MT5 P&L calculation
+                        trade_pnl = (exit_price - entry_price) * lot_size * contract_size
+
+                    else:  # SHORT
+                        # If both levels touched, SL first (worst)
+                        if candle_high >= sl and candle_low <= tp:
+                            exit_price = sl
+                            exit_reason = 'SL'
+                        elif candle_high >= sl:
+                            exit_price = sl
+                            exit_reason = 'SL'
+                        elif candle_low <= tp:
+                            exit_price = tp
+                            exit_reason = 'TP'
+                        else:
+                            continue  # Should not happen
+
+                        # MT5 P&L calculation
+                        trade_pnl = (entry_price - exit_price) * lot_size * contract_size
+
+                    trade_pnl = safe_value(trade_pnl)
+                    position_value = entry_price * lot_size * contract_size
+                    pnl_percent = (trade_pnl / env.equity) if env.equity > 0 else 0
 
                     detailed_trades.append({
                         'type': pos_type,
@@ -69,14 +122,14 @@ def run_rl_backtest_with_tracking(data_df, model, ticker, model_name=""):
                         'close_time': current_time,
                         'sl': sl,
                         'tp': tp,
-                        'size': size,
+                        'lot_size': lot_size,  # Store lot size instead of size
                         'pnl': trade_pnl,
                         'pnl_percent': pnl_percent,
                         'exit_reason': exit_reason,
                         'risk_level': pos.get('risk_level'),
                         'rr_profile_index': pos.get('rr_profile_index')
                     })
-            return pnl
+            return pnl, num_closed
         
         env._update_portfolio = tracked_update
         
@@ -120,23 +173,47 @@ def run_rl_backtest_with_tracking(data_df, model, ticker, model_name=""):
                 'Equity': safe_value(env.equity)
             })
         
-        # Calculate max drawdown
+        # Calculate max drawdown and consecutive drawdown days
         equity_df = pd.DataFrame(equity_curve)
+        max_drawdown = 0
+        max_consecutive_dd_days = 0
+        
         if not equity_df.empty and equity_df['Equity'].max() > 0:
             peak = equity_df['Equity'].cummax()
             drawdown = (equity_df['Equity'] - peak) / peak
             max_drawdown = -safe_value(drawdown.min(), default=0) * 100
-        else:
-            max_drawdown = 0
+            
+            # Calculate consecutive drawdown days (FIXED)
+            # Convert to daily data first to avoid counting candles
+            equity_df_copy = equity_df.copy()
+            equity_df_copy['Date'] = pd.to_datetime(equity_df_copy['Time']).dt.date
+            
+            # Get end-of-day equity and drawdown
+            daily_equity = equity_df_copy.groupby('Date').agg({
+                'Equity': 'last'
+            }).reset_index()
+            
+            # Calculate daily peak and drawdown
+            daily_peak = daily_equity['Equity'].cummax()
+            daily_drawdown = (daily_equity['Equity'] - daily_peak) / daily_peak
+            daily_equity['in_drawdown'] = daily_drawdown < -0.0001  # Small threshold to avoid rounding issues
+            
+            # Group consecutive drawdown days
+            daily_equity['dd_group'] = (daily_equity['in_drawdown'] != daily_equity['in_drawdown'].shift()).cumsum()
+            
+            # Count consecutive days in drawdown
+            if daily_equity['in_drawdown'].any():
+                dd_groups = daily_equity[daily_equity['in_drawdown']].groupby('dd_group').size()
+                max_consecutive_dd_days = int(dd_groups.max()) if not dd_groups.empty else 0
         
         trades_df = pd.DataFrame(detailed_trades)
         
-        return equity_df, trades_df, max_drawdown
+        return equity_df, trades_df, max_drawdown, max_consecutive_dd_days
         
     except Exception as e:
         logger.error(f"Fatal error in backtest for {model_name}: {e}")
         logger.error(traceback.format_exc())
-        return pd.DataFrame(), pd.DataFrame(), 0
+        return pd.DataFrame(), pd.DataFrame(), 0, 0
 
 
 def generate_trade_breakdown(trades_df, model_name):
@@ -390,12 +467,12 @@ def backtest_worker(model_path, data_path, ticker):
         model = PPO.load(model_path, device="cpu")
         
         # Run backtest with tracking
-        equity_curve, trades, max_drawdown = run_rl_backtest_with_tracking(
+        equity_curve, trades, max_drawdown, max_consecutive_dd_days = run_rl_backtest_with_tracking(
             backtest_df, model, ticker, model_name
         )
         
         if not equity_curve.empty:
-            metrics = reporting.calculate_metrics(equity_curve, trades, max_drawdown)
+            metrics = reporting.calculate_metrics(equity_curve, trades, max_drawdown, max_consecutive_dd_days)
             logger.info(f"✅ Completed: {model_name} | Calmar: {metrics.get('Calmar Ratio', 0):.2f}")
             return {
                 "model_name": model_name,
@@ -508,7 +585,7 @@ def main():
     print("="*120)
     summary_columns = [
         'model_name', 'Calmar Ratio', 'Profit Factor', 'Total Return (%)',
-        'Winning Months (%)', 'Win Rate (%)', 'Total Trades', 'Max Drawdown (%)'
+        'Winning Days', 'Win Rate (%)', 'Total Trades', 'Max Drawdown (%)', 'Max Consecutive DD Days'
     ]
     print(results_df.head(10).reindex(columns=summary_columns).fillna(0).to_string(index=False))
     print("="*120)
@@ -526,6 +603,8 @@ def main():
         print(f"  📊 Total Return: {best_model_info['Total Return (%)']:.2f}%")
         print(f"  ✅ Win Rate: {best_model_info['Win Rate (%)']:.2f}%")
         print(f"  📉 Max Drawdown: {best_model_info['Max Drawdown (%)']:.2f}%")
+        print(f"  ⏰ Max Consecutive DD Days: {int(best_model_info.get('Max Consecutive DD Days', 0))}")
+        print(f"  📅 Winning Days: {best_model_info.get('Winning Days', 'N/A')}")
         print(f"  🎯 Total Trades: {int(best_model_info['Total Trades'])}")
         print("=" * 80)
         
@@ -535,11 +614,11 @@ def main():
             print(breakdown_report)
         
         print(f"\n💡 ACTION: Consider using '{best_model_info['model_name']}' for live trading")
-        #print(f"📁 Results saved to: {excel_path}")
-        #print(f"📊 Excel includes: Summary, All Trades, Equity Curves, Risk/RR Breakdowns, Top Performers")
+        print(f"📁 Results saved to: {excel_path}")
+        print(f"📊 Excel includes: Summary, All Trades, Equity Curves, Risk/RR Breakdowns, Top Performers")
         
         # Plot equity curve for best model
-        """try:     
+        try:     
             equity_curve = best_result['equity_curve']
             plt.figure(figsize=(14, 7))
             plt.plot(equity_curve['Time'], equity_curve['Equity'], label='Equity Curve', linewidth=2, color='blue')
@@ -556,7 +635,7 @@ def main():
             logger.info(f"📈 Best model equity plot saved: {plot_path}")
             plt.show()
         except Exception as e:
-            logger.warning(f"Could not generate plot: {e}")"""
+            logger.warning(f"Could not generate plot: {e}")
     
     logger.info("\n" + "=" * 80)
     logger.info("✅ BACKTESTING COMPLETE!")

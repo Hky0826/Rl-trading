@@ -122,6 +122,7 @@ class TradingEnv(gym.Env):
         return obs, {}
 
     def _calculate_floating_pnl(self):
+        """Calculate unrealized P&L for open positions using lot-based system."""
         if not self.open_positions:
             self._last_floating_pnl = 0.0
             return 0.0
@@ -131,14 +132,23 @@ class TradingEnv(gym.Env):
 
         floating_pnl = 0.0
         for p in self.open_positions:
-            price = safe_value(p.get('price', 0.0))
-            size = safe_value(p.get('size', 0.0), default=0.0, clip_min=0.0, clip_max=_MAX_POSITION_SIZE)
-            if size <= 0:
+            entry_price = safe_value(p.get('price', 0.0))
+            lot_size = safe_value(p.get('lot_size', 0.0), default=0.0, clip_min=0.0, clip_max=100.0)
+            
+            if lot_size <= 0:
                 continue
+            
+            # MT5 Lot System: Price difference * Lot Size * Contract Size
+            # For standard forex pairs: 1 lot = 100,000 units
+            contract_size = getattr(config, 'CONTRACT_SIZE', 100000)
+            
             if p.get('type') == 'LONG':
-                pnl = (current_price - price) * size
-            else:
-                pnl = (price - current_price) * size
+                # Long P&L = (Current Price - Entry Price) * Lots * Contract Size
+                pnl = (current_price - entry_price) * lot_size * contract_size
+            else:  # SHORT
+                # Short P&L = (Entry Price - Current Price) * Lots * Contract Size
+                pnl = (entry_price - current_price) * lot_size * contract_size
+            
             floating_pnl += float(np.clip(pnl, -_MAX_PNL, _MAX_PNL))
 
         floating_pnl = float(np.clip(floating_pnl, -_MAX_PNL, _MAX_PNL))
@@ -171,14 +181,6 @@ class TradingEnv(gym.Env):
             # Win Rate
             if len(self.win_history) > 0:
                 r_winrate = sum(self.win_history) / len(self.win_history)
-            
-            # Average R:R
-            if len(self.rr_history) > 0:
-                r_avg_rr = sum(self.rr_history) / len(self.rr_history)
-            
-            # Average Risk
-            if len(self.risk_history) > 0:
-                r_avg_risk = sum(self.risk_history) / len(self.risk_history)
 
         # Combine with Weights
         weights = config.REWARD_WEIGHTS
@@ -186,9 +188,7 @@ class TradingEnv(gym.Env):
         reward = (
             weights['pnl'] * r_pnl +
             weights['drawdown'] * r_drawdown +
-            weights['winrate'] * r_winrate +
-            weights['avg_rr'] * r_avg_rr +
-            weights['avg_risk'] * r_avg_risk
+            weights['winrate'] * r_winrate
         )
 
         return safe_value(reward, default=0.0, clip_min=-1e9, clip_max=1e9)
@@ -196,9 +196,9 @@ class TradingEnv(gym.Env):
     def _update_portfolio(self):
         """
         Update portfolio by checking if SL or TP hit on existing positions.
+        Uses MT5-style lot-based P&L calculation.
         
         CRITICAL: Positions are ONLY closed when SL or TP is hit.
-        No other exit conditions exist (no time-based exits, no manual closes, etc.)
         """
         if not self.open_positions:
             return 0.0, 0
@@ -208,66 +208,69 @@ class TradingEnv(gym.Env):
 
         idx = max(0, min(len(self.close_prices) - 1, int(self.current_step - 1)))
         current_price = safe_value(self.close_prices[idx], default=0.0)
+        
+        contract_size = getattr(config, 'CONTRACT_SIZE', 100000)
 
         for position in list(self.open_positions):
             sl = safe_value(position.get('sl', np.nan), default=np.nan)
             tp = safe_value(position.get('tp', np.nan), default=np.nan)
-            price = safe_value(position.get('price', 0.0), default=0.0)
-            size = safe_value(position.get('size', 0.0), default=0.0, clip_min=0.0, clip_max=_MAX_POSITION_SIZE)
+            entry_price = safe_value(position.get('price', 0.0), default=0.0)
+            lot_size = safe_value(position.get('lot_size', 0.0), default=0.0, clip_min=0.0, clip_max=100.0)
 
-            if size <= 0:
+            if lot_size <= 0:
                 positions_to_close.append(position)
                 continue
 
             # Check ONLY for SL/TP hits - no other exit conditions
-            # Data is assumed to be BID prices
             
             if position.get('type') == 'LONG':
                 # Long Exit: Sell at Bid
                 # Check SL hit (Bid <= SL)
                 if not np.isnan(sl) and self.low_prices[idx] <= sl + _EPS:
                     close_price = sl
-                    pnl = (close_price - price) * size
+                    # MT5 P&L: (Exit - Entry) * Lots * Contract Size
+                    pnl = (close_price - entry_price) * lot_size * contract_size
                     total_pnl += pnl
                     positions_to_close.append(position)
-                    denom = price * size
+                    # Return as percentage
+                    denom = entry_price * lot_size * contract_size
                     pct = safe_div(pnl, denom, default=0.0)
                     self.recent_returns.append(safe_value(pct))
+                    
                 # Check TP hit (Bid >= TP)
                 elif not np.isnan(tp) and self.high_prices[idx] >= tp - _EPS:
                     close_price = tp
-                    pnl = (close_price - price) * size
+                    pnl = (close_price - entry_price) * lot_size * contract_size
                     total_pnl += pnl
                     positions_to_close.append(position)
-                    denom = price * size
+                    denom = entry_price * lot_size * contract_size
                     pct = safe_div(pnl, denom, default=0.0)
                     self.recent_returns.append(safe_value(pct))
                 
             else:  # SHORT
                 # Short Exit: Buy at Ask (Bid + Spread)
-                # Ask High = High + Spread
-                # Ask Low = Low + Spread
-                
                 spread_cost = config.SPREAD_PIPS * config.PIP_VALUE
                 ask_high = self.high_prices[idx] + spread_cost
                 ask_low = self.low_prices[idx] + spread_cost
                 
-                # Check SL hit (Ask >= SL) -> (High + Spread >= SL)
+                # Check SL hit (Ask >= SL)
                 if not np.isnan(sl) and ask_high >= sl - _EPS:
                     close_price = sl
-                    pnl = (price - close_price) * size
+                    # MT5 P&L: (Entry - Exit) * Lots * Contract Size
+                    pnl = (entry_price - close_price) * lot_size * contract_size
                     total_pnl += pnl
                     positions_to_close.append(position)
-                    denom = price * size
+                    denom = entry_price * lot_size * contract_size
                     pct = safe_div(pnl, denom, default=0.0)
                     self.recent_returns.append(safe_value(pct))
-                # Check TP hit (Ask <= TP) -> (Low + Spread <= TP)
+                    
+                # Check TP hit (Ask <= TP)
                 elif not np.isnan(tp) and ask_low <= tp + _EPS:
                     close_price = tp
-                    pnl = (price - close_price) * size
+                    pnl = (entry_price - close_price) * lot_size * contract_size
                     total_pnl += pnl
                     positions_to_close.append(position)
-                    denom = price * size
+                    denom = entry_price * lot_size * contract_size
                     pct = safe_div(pnl, denom, default=0.0)
                     self.recent_returns.append(safe_value(pct))
 
@@ -311,13 +314,12 @@ class TradingEnv(gym.Env):
 
     def _execute_action(self, action_type, risk_index, rr_profile_index):
         """
-        Execute trading action on CURRENT candle (realistic timing).
+        Execute trading action using MT5-style lot sizing.
         
-        Key behavior:
-        - Observation was created from candles 0 to current_step-1 (completed)
-        - Action is executed on candle at current_step (forming/current candle)
-        - In live trading: you observe completed candles, then execute on next candle
-        - Uses current_step-1 for price data since current_step hasn't fully formed yet
+        Key changes:
+        - Calculate lot size instead of position size in units
+        - Use MT5 lot sizing formula: Lots = Risk Amount / (Stop Distance in Quote Currency)
+        - Store lot_size in position for P&L calculations
         """
         try:
             action_type = int(action_type)
@@ -333,8 +335,7 @@ class TradingEnv(gym.Env):
 
         self.consecutive_holds = 0
         
-        # Use the last COMPLETED candle for ATR reference (prediction)
-        # But execute on the CURRENT candle Open (execution)
+        # Use the last COMPLETED candle for ATR reference
         idx_prev = max(0, min(len(self.close_prices) - 1, int(self.current_step - 1)))
         idx_curr = max(0, min(len(self.open_prices) - 1, int(self.current_step)))
         
@@ -361,12 +362,12 @@ class TradingEnv(gym.Env):
             # Buy at Ask = Open + Spread
             entry_price = current_open_price + spread_val
             
-            # SL/TP based on Entry Price (or pattern? usually based on entry)
+            # SL/TP based on Entry Price
             sl = entry_price - (atr * sl_multiplier)
             tp = entry_price + (atr * tp_multiplier)
             pos_type = 'LONG'
             
-        else: # SHORT
+        else: # SHORT (action_type == 2)
             # Sell at Bid = Open
             entry_price = current_open_price
             
@@ -374,52 +375,50 @@ class TradingEnv(gym.Env):
             tp = entry_price - (atr * tp_multiplier)
             pos_type = 'SHORT'
 
+        # Calculate stop distance in price
         stop_distance = abs(entry_price - sl)
         stop_distance = max(stop_distance, _EPS)
 
         if stop_distance > 0 and self.equity > 0:
-            # Lot Size Calculation
+            # MT5 Lot Size Calculation
             risk_amount = self.equity * (risk_percent / 100.0)
             
-            # Standard Forex Lot Calculation:
-            # Risk = (Entry - SL) * Lots * Standard_Lot_Size
-            # Lots = Risk / ((Entry - SL) * Standard_Lot_Size)
+            # Contract size (standard lot = 100,000 units)
+            contract_size = getattr(config, 'CONTRACT_SIZE', 100000)
             
-            raw_lots = risk_amount / (stop_distance * config.STANDARD_LOT_SIZE)
+            # Lot Size Formula:
+            # Risk Amount = Stop Distance * Lot Size * Contract Size
+            # Therefore: Lot Size = Risk Amount / (Stop Distance * Contract Size)
+            raw_lot_size = risk_amount / (stop_distance * contract_size)
             
-            # Round to Lot Step (0.01)
-            lots = math.floor(raw_lots / config.LOT_STEP) * config.LOT_STEP
-            lots = max(lots, config.MIN_LOT_SIZE)
+            # Round to lot step (typically 0.01 for mini lots)
+            lot_step = getattr(config, 'LOT_STEP', 0.01)
+            lot_size = math.floor(raw_lot_size / lot_step) * lot_step
             
-            # Convert back to units for PnL calculation
-            size = lots * config.STANDARD_LOT_SIZE
+            # Apply min/max lot size limits
+            min_lot = getattr(config, 'MIN_LOT_SIZE', 0.01)
+            max_lot = getattr(config, 'MAX_LOT_SIZE', 100.0)
+            lot_size = max(min_lot, min(lot_size, max_lot))
             
-            size = safe_value(size, default=0.0, clip_min=0.0, clip_max=_MAX_POSITION_SIZE)
-            
-            if size > 0 and np.isfinite(size):
+            if lot_size > 0 and np.isfinite(lot_size):
                 new_position = {
                     'type': pos_type,
                     'price': float(entry_price),
                     'sl': float(sl),
                     'tp': float(tp),
-                    'size': float(size),
-                    'lots': float(lots),
+                    'lot_size': float(lot_size),  # Store lot size for MT5-style calculations
                     'risk_level': int(risk_index),
                     'rr_profile_index': int(rr_profile_index)
                 }
                 self.open_positions.append(new_position)
                 self._just_opened_trade = True
+                _logger.debug(f"Opened {pos_type} position: {lot_size:.2f} lots at {entry_price:.5f}, SL={sl:.5f}, TP={tp:.5f}")
             else:
-                _logger.debug("Rejected position due to invalid size: %s (raw_lots=%s)", size, raw_lots)
+                _logger.debug(f"Rejected position due to invalid lot size: {lot_size:.2f} (raw={raw_lot_size:.4f})")
 
     def _next_observation(self):
         """
         Create observation from COMPLETED candles only (realistic timing).
-        
-        Key behavior:
-        - At step N, we observe candles 0 to N-1 (completed candles)
-        - This matches live trading where you can only see completed candles
-        - The action taken will be executed on candle N (current/forming candle)
         """
         # Get completed candles up to (but not including) current step
         end = int(self.current_step)

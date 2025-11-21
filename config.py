@@ -49,7 +49,7 @@ INDICATOR_LOOKBACK_CANDLES = 300
 INITIAL_TRAINING_TIMESTEPS = 5_000_000
 CONTINUOUS_TRAINING_TIMESTEPS = 5_000_000
 RL_LOOKBACK_WINDOW = 48
-INITIAL_EQUITY = 200.00
+INITIAL_EQUITY = 20000.00
 
 # Dynamic CPU usage based on system resources
 def get_optimal_cpu_count():
@@ -77,15 +77,15 @@ def get_device_optimized_hyperparams():
     
     if device == "cuda":
         # GPU optimizations
-        batch_size = 256
+        batch_size = 1024
         n_steps = 4096
         n_epochs = 10
-        net_arch = {"pi": [128, 128, 64], "vf": [128, 128, 64]}
+        net_arch = {"pi": [256, 256, 128], "vf": [256, 256, 128]}
     else:
         # CPU optimizations - smaller networks and batches
         batch_size = 1024
         n_steps = 4096
-        n_epochs = 8
+        n_epochs = 10
         net_arch = {"pi": [256, 256, 128], "vf": [256, 256, 128]}
     
     return {
@@ -135,10 +135,8 @@ REWARD_WEIGHTS = {
     'pnl': 1.0,
     'drawdown': 0.5,
     'winrate': 0.1,
-    'avg_rr': 0.1,
-    'avg_risk': 0.1
 }
-REWARD_METRIC_WINDOW = 100  # Rolling window for winrate, avg_rr, avg_risk
+REWARD_METRIC_WINDOW = 100  # Rolling window for winrate
 
 # Reduced complexity for faster computation
 DRAWDOWN_PENALTY_SCALAR = 0.1
