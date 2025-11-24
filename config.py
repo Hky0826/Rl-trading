@@ -111,12 +111,8 @@ PPO_HYPERPARAMS = get_device_optimized_hyperparams()
 # --- Timeframe Configuration ---
 PRIMARY_TIMEFRAME_STRING = "M5"
 TREND_TIMEFRAME_STRING = "M30"
-TIMEFRAME_MAP = {
-    "M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5, "M15": mt5.TIMEFRAME_M15,
-    "M30": mt5.TIMEFRAME_M30, "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4,
-}
-PRIMARY_TIMEFRAME_MT5 = TIMEFRAME_MAP[PRIMARY_TIMEFRAME_STRING]
-TREND_TIMEFRAME_MT5 = TIMEFRAME_MAP[TREND_TIMEFRAME_STRING]
+PRIMARY_TIMEFRAME_MT5 = "M5"
+TREND_TIMEFRAME_MT5 = "M30"
 
 # Calculate candles per day
 minutes_per_candle = 0
@@ -132,9 +128,9 @@ else:
 # --- Simplified Reward Function Configuration ---
 # Scalarization-Based MORL Weights
 REWARD_WEIGHTS = {
-    'pnl': 1.0,
-    'drawdown': 0.5,
-    'winrate': 0.1,
+    'pnl': 0.4,
+    'drawdown': 0.7,
+    'winrate': 0.5,
 }
 REWARD_METRIC_WINDOW = 100  # Rolling window for winrate
 
