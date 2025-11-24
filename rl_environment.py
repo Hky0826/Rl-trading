@@ -213,7 +213,8 @@ class TradingEnv(gym.Env):
         reward = (
             weights['pnl'] * r_pnl +
             weights['drawdown'] * r_drawdown +
-            weights['winrate'] * r_winrate
+            weights['winrate'] * r_winrate +
+            weights['rrpnl'] * rr_pnl
         )
 
         return safe_value(reward, default=0.0, clip_min=-1e9, clip_max=1e9)
