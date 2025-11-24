@@ -3,7 +3,7 @@
 # =============================================================================
 # pip install stable-baselines3[extra] gymnasium torch pandas pyarrow tqdm matplotlib numba Flask Flask-HTTPAuth opencv-python-headless psutil
 
-import MetaTrader5 as mt5
+#import MetaTrader5 as mt5
 import logging
 import psutil
 import torch
@@ -128,9 +128,10 @@ else:
 # --- Simplified Reward Function Configuration ---
 # Scalarization-Based MORL Weights
 REWARD_WEIGHTS = {
-    'pnl': 0.4,
-    'drawdown': 0.7,
-    'winrate': 0.5,
+    'pnl': 0.05,
+    'drawdown': 0.1,
+    'winrate': 0.3,
+    'rrpnl' : 1.0
 }
 REWARD_METRIC_WINDOW = 100  # Rolling window for winrate
 

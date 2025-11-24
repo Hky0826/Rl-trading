@@ -175,6 +175,33 @@ class TradingEnv(gym.Env):
         # 3. Metrics Components (Only applied when trades close to avoid living bonus)
         r_winrate = 0.0
 
+        # 4. Pnl Risk to reward
+        try:
+            _, risk_index, rr_profile_index = action
+            risk_index = int(np.clip(int(risk_index), 0, len(config.RISK_LEVELS) - 1))
+            rr_profile_index = int(np.clip(int(rr_profile_index), 0, len(config.RR_PROFILES) - 1))
+        except Exception:
+            return 0.0
+
+        # === Base RR profile scores (customizable) ===
+        # Example: higher RR = higher difficulty = higher score
+        rr_scores = [1.2, 1.3, 1.4, 1.2, 1.3,
+                    1.4, 1.2, 1.3, 1.4, 1.2]
+
+        rr_score = rr_scores[rr_profile_index]
+        risk_multiplier = config.RISK_LEVELS[risk_index]
+
+        # === Determine PnL direction ===
+        if total_pnl_closed_this_step > 0:
+            direction = 1.0   # profitable
+        elif total_pnl_closed_this_step < 0:
+            direction = -1.0  # losing trade
+        else:
+            direction = 0.0   # no trade closed
+
+        # === Reward composition ===
+        rr_pnl = rr_score * risk_multiplier * direction
+
         if num_closed_trades > 0:
             # Win Rate
             if len(self.win_history) > 0:
