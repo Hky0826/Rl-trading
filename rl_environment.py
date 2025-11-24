@@ -174,8 +174,6 @@ class TradingEnv(gym.Env):
 
         # 3. Metrics Components (Only applied when trades close to avoid living bonus)
         r_winrate = 0.0
-        r_avg_rr = 0.0
-        r_avg_risk = 0.0
 
         if num_closed_trades > 0:
             # Win Rate
@@ -232,7 +230,10 @@ class TradingEnv(gym.Env):
                     pnl = (close_price - entry_price) * lot_size * contract_size
                     total_pnl += pnl
                     positions_to_close.append(position)
-                    # Return as percentage
+                    # Store actual P&L in position for tracking
+                    position['realized_pnl'] = pnl
+                    position['exit_price'] = close_price
+                    position['exit_reason'] = 'SL'
                     denom = entry_price * lot_size * contract_size
                     pct = safe_div(pnl, denom, default=0.0)
                     self.recent_returns.append(safe_value(pct))
@@ -243,6 +244,10 @@ class TradingEnv(gym.Env):
                     pnl = (close_price - entry_price) * lot_size * contract_size
                     total_pnl += pnl
                     positions_to_close.append(position)
+                    # Store actual P&L in position for tracking
+                    position['realized_pnl'] = pnl
+                    position['exit_price'] = close_price
+                    position['exit_reason'] = 'TP'
                     denom = entry_price * lot_size * contract_size
                     pct = safe_div(pnl, denom, default=0.0)
                     self.recent_returns.append(safe_value(pct))
@@ -260,6 +265,10 @@ class TradingEnv(gym.Env):
                     pnl = (entry_price - close_price) * lot_size * contract_size
                     total_pnl += pnl
                     positions_to_close.append(position)
+                    # Store actual P&L in position for tracking
+                    position['realized_pnl'] = pnl
+                    position['exit_price'] = close_price
+                    position['exit_reason'] = 'SL'
                     denom = entry_price * lot_size * contract_size
                     pct = safe_div(pnl, denom, default=0.0)
                     self.recent_returns.append(safe_value(pct))
@@ -270,6 +279,10 @@ class TradingEnv(gym.Env):
                     pnl = (entry_price - close_price) * lot_size * contract_size
                     total_pnl += pnl
                     positions_to_close.append(position)
+                    # Store actual P&L in position for tracking
+                    position['realized_pnl'] = pnl
+                    position['exit_price'] = close_price
+                    position['exit_reason'] = 'TP'
                     denom = entry_price * lot_size * contract_size
                     pct = safe_div(pnl, denom, default=0.0)
                     self.recent_returns.append(safe_value(pct))
@@ -278,23 +291,21 @@ class TradingEnv(gym.Env):
 
         # Only remove positions that hit SL or TP
         if positions_to_close:
-            self.equity = float(np.clip(self.equity + total_pnl, -_MAX_PNL, _MAX_PNL))
+            # CRITICAL FIX: Ensure equity doesn't go negative incorrectly
+            new_equity = self.equity + total_pnl
+            
+            # Clamp to reasonable bounds but allow negative (for proper termination)
+            self.equity = float(np.clip(new_equity, -_MAX_PNL, _MAX_PNL))
+            
             self.open_positions = [p for p in self.open_positions if p not in positions_to_close]
             
             # Update MORL metrics
             for p in positions_to_close:
-                # Win/Loss Logic
-                p_type = p.get('type')
-                p_tp = safe_value(p.get('tp', 0.0))
+                # Win/Loss Logic - use stored exit info
+                exit_price = p.get('exit_price', current_price)
+                exit_reason = p.get('exit_reason', 'UNKNOWN')
                 
-                is_win = 0.0
-                if p_type == 'LONG':
-                    if not np.isnan(p_tp) and current_price >= p_tp - _EPS:
-                        is_win = 1.0
-                else: # SHORT
-                    if not np.isnan(p_tp) and current_price <= p_tp + _EPS:
-                        is_win = 1.0
-                
+                is_win = 1.0 if exit_reason == 'TP' else 0.0
                 self.win_history.append(is_win)
                 
                 # R:R
