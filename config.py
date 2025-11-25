@@ -3,7 +3,7 @@
 # =============================================================================
 # pip install stable-baselines3[extra] gymnasium torch pandas pyarrow tqdm matplotlib numba Flask Flask-HTTPAuth opencv-python-headless psutil
 
-#import MetaTrader5 as mt5
+import MetaTrader5 as mt5
 import logging
 import psutil
 import torch
@@ -33,7 +33,7 @@ MAX_DRAWDOWN_PERCENT = 100.0
 MAX_VALIDATION_DRAWDOWN_PERCENT = 80.0
 
 # --- Execution Configuration ---
-SPREAD_PIPS = 2.5
+SPREAD_PIPS = 2.5#2.5
 PIP_VALUE = 0.0001  # Standard for most majors like EURUSD
 STANDARD_LOT_SIZE = 100000
 LOT_STEP = 0.01
@@ -49,7 +49,7 @@ INDICATOR_LOOKBACK_CANDLES = 300
 INITIAL_TRAINING_TIMESTEPS = 5_000_000
 CONTINUOUS_TRAINING_TIMESTEPS = 5_000_000
 RL_LOOKBACK_WINDOW = 48
-INITIAL_EQUITY = 20000.00
+INITIAL_EQUITY = 200.00
 
 # Dynamic CPU usage based on system resources
 def get_optimal_cpu_count():
@@ -111,8 +111,12 @@ PPO_HYPERPARAMS = get_device_optimized_hyperparams()
 # --- Timeframe Configuration ---
 PRIMARY_TIMEFRAME_STRING = "M5"
 TREND_TIMEFRAME_STRING = "M30"
-PRIMARY_TIMEFRAME_MT5 = "M5"
-TREND_TIMEFRAME_MT5 = "M30"
+TIMEFRAME_MAP = {
+    "M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5, "M15": mt5.TIMEFRAME_M15,
+    "M30": mt5.TIMEFRAME_M30, "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4,
+}
+PRIMARY_TIMEFRAME_MT5 = TIMEFRAME_MAP[PRIMARY_TIMEFRAME_STRING]
+TREND_TIMEFRAME_MT5 = TIMEFRAME_MAP[TREND_TIMEFRAME_STRING]
 
 # Calculate candles per day
 minutes_per_candle = 0
@@ -128,10 +132,10 @@ else:
 # --- Simplified Reward Function Configuration ---
 # Scalarization-Based MORL Weights
 REWARD_WEIGHTS = {
-    'pnl': 0.05,
-    'drawdown': 0.1,
-    'winrate': 0.3,
-    'rrpnl' : 1.0
+    'pnl': 0.03,
+    'drawdown': 0.2,
+    'winrate': 0.0,
+    'rrpnl' : 0.5
 }
 REWARD_METRIC_WINDOW = 100  # Rolling window for winrate
 
@@ -173,7 +177,7 @@ RR_PROFILES = [
 MAX_DRAWDOWN = 0.50
 MIN_TRADE_FREQUENCY = 0.05
 MAX_TRADE_FREQUENCY = 0.20
-CONSTRAINT_VIOLATION_PENALTY = -10.0
+CONSTRAINT_VIOLATION_PENALTY = -1.0
 
 # Power Save Mode
 POWER_SAVE_MODE = False
@@ -188,6 +192,11 @@ USE_NUMBA_ACCELERATION = True
 VECTORIZED_OPERATIONS = True
 CACHE_INDICATORS = True
 PRECOMPUTE_FEATURES = True
+
+CURRICULUM_PHASE = 'all'  # or 1, 2, 3
+PHASE1_TIMESTEPS = 2_000_000
+PHASE2_TIMESTEPS = 3_000_000
+PHASE3_TIMESTEPS = 5_000_000
 
 # Dashboard Configuration
 DASHBOARD_USERNAME = "your_username"

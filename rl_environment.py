@@ -534,11 +534,24 @@ class TradingEnv(gym.Env):
         Execute one step with curriculum phase logic.
         Action is ALWAYS parsed as [direction, rr_profile, risk_level]
         but may be overridden internally based on phase.
+        
+        Phase 1: Does NOT terminate on negative equity (learning focus)
+        Phase 2-3: Terminates on negative equity (risk awareness)
         """
-        if self.equity <= 0:
-            self.current_step += 1
-            obs = self._next_observation()
-            return obs, float(config.CONSTRAINT_VIOLATION_PENALTY), True, False, {}
+        # Phase-specific equity termination logic
+        if self.phase == 1:
+            # Phase 1: Allow negative equity - focus on direction learning
+            # Don't terminate early, let agent learn from full episodes
+            if self.equity <= 0:
+                # Reset equity to small amount to continue learning
+                self.equity = float(config.INITIAL_EQUITY * 0.1)  # 10% of initial
+                _logger.debug(f"Phase 1: Equity reset to {self.equity:.2f} to continue learning")
+        else:
+            # Phase 2 & 3: Terminate on bankruptcy
+            if self.equity <= 0:
+                self.current_step += 1
+                obs = self._next_observation()
+                return obs, float(config.CONSTRAINT_VIOLATION_PENALTY), True, False, {}
 
         try:
             action_type, rr_index, risk_index = action
@@ -564,7 +577,9 @@ class TradingEnv(gym.Env):
 
         if not np.isfinite(self.equity):
             self.equity = safe_value(self.equity, default=0.0)
-        if self.equity <= 0:
+        
+        # Phase 2 & 3: Apply termination penalty for bankruptcy
+        if self.equity <= 0 and self.phase > 1:
             terminated = True
             reward += float(config.CONSTRAINT_VIOLATION_PENALTY)
 
