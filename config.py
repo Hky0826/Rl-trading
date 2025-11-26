@@ -1,7 +1,9 @@
 # File: config_optimized.py
 # Description: Optimized configuration for better performance
 # =============================================================================
-# pip install stable-baselines3[extra] gymnasium torch pandas pyarrow tqdm matplotlib numba Flask Flask-HTTPAuth opencv-python-headless psutil
+# pip install stable-baselines3[extra] gymnasium torch pandas pyarrow tqdm matplotlib numba Flask Flask-HTTPAuth opencv-python-headless psutil optuna optuna-dashboard plotly sb3_contrib
+
+import MetaTrader5 as mt5
 import logging
 import psutil
 import torch
@@ -25,7 +27,7 @@ MAX_POSITIONS_PER_SYMBOL = MAX_TOTAL_POSITIONS
 GUI_STATUS_FILE = "live_status.json"
 
 # --- General Risk Management ---
-RISK_LEVELS = [0.5, 1.0, 2.0] 
+RISK_LEVELS = [0.25, 0.5, 1.0] 
 MIN_LOT_SIZE = 0.01
 MAX_DRAWDOWN_PERCENT = 100.0
 MAX_VALIDATION_DRAWDOWN_PERCENT = 80.0
@@ -46,7 +48,7 @@ INDICATOR_LOOKBACK_CANDLES = 300
 # Training settings optimized for speed
 INITIAL_TRAINING_TIMESTEPS = 5_000_000
 CONTINUOUS_TRAINING_TIMESTEPS = 5_000_000
-RL_LOOKBACK_WINDOW = 48
+RL_LOOKBACK_WINDOW = 96
 INITIAL_EQUITY = 200.00
 
 # Dynamic CPU usage based on system resources
@@ -63,42 +65,36 @@ def get_optimal_cpu_count():
     
     # Take the minimum to avoid resource exhaustion
     optimal_count = min(max_envs_by_cpu, max_envs_by_memory, 12)  # Cap at 12
-    optimal_count = 8
+    optimal_count = 4
     return optimal_count
 
 NUM_CPU_TO_USE = get_optimal_cpu_count()
 
 # Optimized PPO hyperparameters
 def get_device_optimized_hyperparams():
-    """Returns hyperparameters optimized for the current device"""
+    """Returns hyperparameters optimized for the current device (LSTM Version)"""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    if device == "cuda":
-        # GPU optimizations
-        batch_size = 1024
-        n_steps = 4096
-        n_epochs = 10
-        net_arch = {"pi": [256, 256, 128], "vf": [256, 256, 128]}
-    else:
-        # CPU optimizations - smaller networks and batches
-        batch_size = 1024
-        n_steps = 4096
-        n_epochs = 10
-        net_arch = {"pi": [256, 256, 128], "vf": [256, 256, 128]}
-    
+    # LSTM generally requires slightly lower learning rates and careful batching
     return {
-        "n_steps": n_steps,
-        "batch_size": batch_size,
-        "n_epochs": n_epochs,
+        "n_steps": 2048, # Lower than feed-forward, sequences consume more RAM
+        "batch_size": 512, # Batch size in terms of sequences
+        "n_epochs": 10,
         "gamma": 0.99,
         "gae_lambda": 0.95,
-        "clip_range": ConstantSchedule(0.1),
+        "clip_range": ConstantSchedule(0.2),
         "ent_coef": 0.01,
         "vf_coef": 0.5,
         "max_grad_norm": 0.5,
-        "learning_rate": 0.0001, 
+        "learning_rate": 0.0003, 
         "policy_kwargs": {
-            "net_arch": net_arch,
+            # LSTM Specifics
+            "lstm_hidden_size": 256,
+            "n_lstm_layers": 2,
+            "shared_lstm": False, # Separate LSTMs for Actor and Critic
+            "enable_critic_lstm": True,
+            # Feature extractor before the LSTM
+            "net_arch": dict(pi=[64, 64], vf=[64, 64]),
             "activation_fn": torch.nn.ReLU,
             "ortho_init": True,
         }
@@ -109,8 +105,12 @@ PPO_HYPERPARAMS = get_device_optimized_hyperparams()
 # --- Timeframe Configuration ---
 PRIMARY_TIMEFRAME_STRING = "M5"
 TREND_TIMEFRAME_STRING = "M30"
-PRIMARY_TIMEFRAME_MT5 = PRIMARY_TIMEFRAME_STRING
-TREND_TIMEFRAME_MT5 = TREND_TIMEFRAME_STRING
+TIMEFRAME_MAP = {
+    "M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5, "M15": mt5.TIMEFRAME_M15,
+    "M30": mt5.TIMEFRAME_M30, "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4,
+}
+PRIMARY_TIMEFRAME_MT5 = TIMEFRAME_MAP[PRIMARY_TIMEFRAME_STRING]
+TREND_TIMEFRAME_MT5 = TIMEFRAME_MAP[TREND_TIMEFRAME_STRING]
 
 # Calculate candles per day
 minutes_per_candle = 0

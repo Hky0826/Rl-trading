@@ -180,23 +180,29 @@ class TradingEnv(gym.Env):
         return floating_pnl
 
     def _calculate_reward(self, total_pnl_closed_this_step=0, num_closed_trades=0, 
-                         closed_positions=None, action=None):
+                          closed_positions=None, action=None):
         """
         Calculate reward based on curriculum phase.
         
-        Phase 1: Binary win/loss reward (+1 for profit, -1 for loss)
-        Phase 2: Normalized by risk (PnL / risk_amount) - teaches R-multiples
-        Phase 3: Full PnL-based reward with drawdown penalties
-        
-        Args:
-            total_pnl_closed_this_step: Total realized P&L from closed trades
-            num_closed_trades: Number of trades closed this step
-            closed_positions: List of position dictionaries that closed
-            action: The action taken this step
+        MODIFICATION: Includes a 'step_penalty' if the agent is inactive 
+        (no open positions and no trades closing) to force market participation.
         """
+        # Define the penalty magnitude (Adjust this if needed)
+        # -0.1 is significant enough to accumulate to -100 over 1000 steps
+        INACTIVITY_PENALTY = -0.05 
+        
+        # Check if the agent is currently "flat" (no exposure to market)
+        is_flat = len(self.open_positions) == 0
+        
+        # ---------------------------------------------------------------------
+        # PHASE 1: Direction Learning
+        # ---------------------------------------------------------------------
         if self.phase == 1:
-            # PHASE 1: Direction Learning - Binary Win/Loss Reward
             if num_closed_trades == 0:
+                # If we are flat and didn't close a trade, apply penalty
+                if is_flat:
+                    return INACTIVITY_PENALTY
+                # If we are holding a position but it didn't close yet, neutral (or small time cost)
                 return 0.0
             
             # Binary reward for each closed trade
@@ -211,41 +217,46 @@ class TradingEnv(gym.Env):
             
             return safe_value(reward, default=0.0, clip_min=-10.0, clip_max=10.0)
         
+        # ---------------------------------------------------------------------
+        # PHASE 2: R:R Strategy Learning
+        # ---------------------------------------------------------------------
         elif self.phase == 2:
-            # PHASE 2: R:R Strategy Learning - Reward Normalized by Risk
             if num_closed_trades == 0:
+                # If we are flat and didn't close a trade, apply penalty
+                if is_flat:
+                    return INACTIVITY_PENALTY
                 return 0.0
             
             reward = 0.0
             if closed_positions:
                 for pos in closed_positions:
                     pnl = pos.get('realized_pnl', 0.0)
-                    risk_amount = pos.get('risk_amount', 1.0)  # Stored during position opening
+                    risk_amount = pos.get('risk_amount', 1.0)
                     
                     if risk_amount > 0:
-                        # Normalize PnL by risk - this is the R-multiple
+                        # Normalize PnL by risk (R-multiple)
                         r_multiple = safe_div(pnl, risk_amount, default=0.0)
                         reward += r_multiple
                     else:
-                        # Fallback to simple PnL
                         reward += safe_div(pnl, max(self._last_current_equity, 1.0), default=0.0)
             
             return safe_value(reward, default=0.0, clip_min=-10.0, clip_max=10.0)
         
-        else:  # Phase 3
-            # PHASE 3: Full Risk Management - Original reward with drawdown penalties
-            
+        # ---------------------------------------------------------------------
+        # PHASE 3: Full Risk Management
+        # ---------------------------------------------------------------------
+        else: 
             # 1. PnL Component (Normalized)
             pnl_norm = safe_div(total_pnl_closed_this_step, max(self._last_current_equity, 1.0), default=0.0)
             r_pnl = safe_value(pnl_norm, default=0.0, clip_min=-1.0, clip_max=1.0)
 
-            # 2. Drawdown Component (Continuous)
+            # 2. Drawdown Component
             current_equity = safe_value(self._last_current_equity, default=self.equity)
             if self.peak_equity <= 0:
                 drawdown = 0.0
             else:
                 drawdown = max(0.0, safe_div((self.peak_equity - current_equity), self.peak_equity, default=0.0))
-            r_drawdown = -(drawdown ** 2)  # Penalty
+            r_drawdown = -(drawdown ** 2)
 
             # 3. Win Rate Component
             r_winrate = 0.0
@@ -257,30 +268,37 @@ class TradingEnv(gym.Env):
                 _, risk_index, rr_profile_index = action
                 risk_index = int(np.clip(int(risk_index), 0, len(config.RISK_LEVELS) - 1))
                 rr_profile_index = int(np.clip(int(rr_profile_index), 0, len(config.RR_PROFILES) - 1))
+                
+                rr_scores = [1.2, 1.3, 1.4, 1.2, 1.3, 1.4, 1.2, 1.3, 1.4, 1.2]
+                rr_score = rr_scores[rr_profile_index]
+                risk_multiplier = config.RISK_LEVELS[risk_index]
+
+                if total_pnl_closed_this_step > 0:
+                    direction = 1.0
+                elif total_pnl_closed_this_step < 0:
+                    direction = -1.0
+                else:
+                    direction = 0.0
+                
+                rr_pnl = rr_score * risk_multiplier * direction
             except Exception:
-                return 0.0
+                rr_pnl = 0.0
 
-            rr_scores = [1.2, 1.3, 1.4, 1.2, 1.3, 1.4, 1.2, 1.3, 1.4, 1.2]
-            rr_score = rr_scores[rr_profile_index]
-            risk_multiplier = config.RISK_LEVELS[risk_index]
-
-            if total_pnl_closed_this_step > 0:
-                direction = 1.0
-            elif total_pnl_closed_this_step < 0:
-                direction = -1.0
-            else:
-                direction = 0.0
-
-            rr_pnl = rr_score * risk_multiplier * direction
+            # 5. Inactivity Penalty Component (New)
+            r_inactivity = 0.0
+            if num_closed_trades == 0 and is_flat:
+                r_inactivity = INACTIVITY_PENALTY
 
             # Combine with Weights
             weights = config.REWARD_WEIGHTS
             
+            # Note: We add r_inactivity directly (unweighted) or you can add a weight for it in config
             reward = (
                 weights['pnl'] * r_pnl +
                 weights['drawdown'] * r_drawdown +
                 weights['winrate'] * r_winrate +
-                weights['rrpnl'] * rr_pnl
+                weights['rrpnl'] * rr_pnl +
+                r_inactivity  # Apply penalty
             )
 
             return safe_value(reward, default=0.0, clip_min=-1e9, clip_max=1e9)

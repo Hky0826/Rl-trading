@@ -1,5 +1,5 @@
 # File: backtester.py
-# Description: Complete backtester with Phase Support
+# Description: Complete backtester with Phase Support and RecurrentPPO (LSTM)
 # =============================================================================
 import pandas as pd
 import numpy as np
@@ -10,7 +10,10 @@ import json
 import re
 from openpyxl import load_workbook
 from tqdm import tqdm
-from stable_baselines3 import PPO
+
+# CHANGED: Import RecurrentPPO
+from sb3_contrib import RecurrentPPO
+
 import multiprocessing
 from functools import partial
 from datetime import datetime
@@ -146,6 +149,11 @@ def run_rl_backtest_with_tracking(data_df, model, ticker, model_name=""):
         total_steps = len(data_df) - env.lookback_window - 1
         
         debug_log = []
+
+        # --- LSTM STATE INITIALIZATION ---
+        lstm_states = None
+        episode_starts = np.ones((1,), dtype=bool)
+        # ---------------------------------
         
         for step in range(total_steps):
             try:
@@ -167,8 +175,19 @@ def run_rl_backtest_with_tracking(data_df, model, ticker, model_name=""):
                         'total_equity': current_equity
                     })
                 
-                action, _ = model.predict(obs, deterministic=True)
+                # --- PREDICT WITH LSTM STATES ---
+                action, lstm_states = model.predict(
+                    obs, 
+                    state=lstm_states, 
+                    episode_start=episode_starts, 
+                    deterministic=True
+                )
+                
                 obs, reward, terminated, truncated, _ = env.step(action)
+
+                # Update episode_starts
+                episode_starts = np.array([terminated or truncated])
+                # --------------------------------
                 
                 if isinstance(obs, dict):
                     for key in obs:
@@ -475,7 +494,8 @@ def backtest_worker(model_path, data_path, ticker):
         
         backtest_df = pd.read_parquet(data_path)
         
-        model = PPO.load(model_path, device="cpu")
+        # CHANGED: Use RecurrentPPO.load for LSTM models
+        model = RecurrentPPO.load(model_path, device="cpu")
         
         equity_curve, trades, max_drawdown, max_consecutive_dd_days = run_rl_backtest_with_tracking(
             backtest_df, model, ticker, model_name
@@ -516,7 +536,7 @@ def main():
     pd.set_option('display.width', 1000)
     
     logger.info("=" * 80)
-    logger.info("🚀 COMPREHENSIVE RL BACKTESTER")
+    logger.info("🚀 COMPREHENSIVE RL BACKTESTER (LSTM SUPPORTED)")
     logger.info("📊 All models tested with Phase 3 environment (full autonomy)")
     logger.info("=" * 80)
     

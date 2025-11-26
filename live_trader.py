@@ -1,6 +1,5 @@
 # File: live_trader.py
-# Description: Live trading with FULL feature set support
-# Key change: Updated feature_columns in get_live_observation to match full feature set
+# Description: Live trading with FULL feature set support + LSTM RecurrentPPO Support
 # =============================================================================
 import logging
 import time
@@ -12,7 +11,10 @@ import json
 import os
 import traceback
 import csv
-from stable_baselines3 import PPO
+
+# CHANGED: Import RecurrentPPO from sb3_contrib for LSTM support
+from sb3_contrib import RecurrentPPO
+
 import config
 import data_handler
 import trade_executor
@@ -77,7 +79,7 @@ class LiveTrader:
     def __init__(self):
         """Initialize the live trader with all components."""
         self.logger = self._setup_logging()
-        self.logger.info("--- Starting Pure RL Live Trading Bot ---")
+        self.logger.info("--- Starting Pure RL Live Trading Bot (LSTM Version) ---")
 
         self.mt5_connected = False
         self.reconnect_attempts = 0
@@ -87,6 +89,10 @@ class LiveTrader:
         self.perf_logger = None
         self.tracker = None
         self.last_candle_times = {ticker: None for ticker in config.TICKERS}
+
+        # LSTM STATE MANAGEMENT
+        self.lstm_states = {}  # Store hidden states for each ticker
+        self.episode_starts = {}  # Track if it's the start of a sequence
 
         self.consecutive_errors = 0
         self.max_consecutive_errors = getattr(config, 'MAX_CONSECUTIVE_ERRORS', 50)
@@ -223,8 +229,9 @@ class LiveTrader:
                 self.logger.critical(f"Model file not found at {model_path}")
                 return False
 
-            self.rl_model = PPO.load(model_path, device="cpu")
-            self.logger.info(f"Successfully loaded RL model from {model_path}")
+            # CHANGED: Use RecurrentPPO.load for LSTM models
+            self.rl_model = RecurrentPPO.load(model_path, device="cpu")
+            self.logger.info(f"Successfully loaded RecurrentPPO model from {model_path}")
             return True
 
         except Exception as e:
@@ -409,15 +416,54 @@ class LiveTrader:
             all_positions = mt5.positions_get()
             if all_positions:
                 active_tickets = [p.ticket for p in all_positions if getattr(p, 'magic', None) == config.MAGIC_NUMBER]
+                self.tracker.cleanup(active_tickets)
+        except Exception as e:
+            self.logger.error(f"Error cleaning up positions: {e}")
+
+    def handle_new_candle(self, ticker, live_data, positions_for_symbol, account_info, live_drawdown):
+        """Handle new candle prediction with LSTM state management."""
+        try:
+            observation = self.get_live_observation(live_data, positions_for_symbol, account_info, live_drawdown)
+
+            if observation is not None:
+                # --- LSTM STATE MANAGEMENT ---
+                current_state = self.lstm_states.get(ticker, None)
+                episode_start = self.episode_starts.get(ticker, True)
+
+                # PREDICT with LSTM State
+                action, next_state = self.rl_model.predict(
+                    observation,
+                    state=current_state,
+                    episode_start=np.array([episode_start]),
+                    deterministic=True
+                )
+
+                # Update state for next step
+                self.lstm_states[ticker] = next_state
+                self.episode_starts[ticker] = False  # Subsequent steps are not starts
+                # -----------------------------
+
+                action_type = action[0][0] # Actions are arrays in RecurrentPPO
+                rr_profile_index = action[0][1]
+                risk_index = action[0][2]
+                
+                self.logger.info(f"Model Prediction ({ticker}): Type={action_type}, RR={rr_profile_index}, Risk={risk_index}")
+
+                risk_percent = config.RISK_LEVELS[int(risk_index)]
+                current_price = live_data['Close'].iloc[-1]
+                atr = live_data['ATR'].iloc[-1]
+
+                if action_type == 2:  # HOLD
+                    self.logger.info(f"Model Decision ({ticker}): HOLD")
                     return
 
                 sl_multiplier, tp_multiplier = config.RR_PROFILES[int(rr_profile_index)]
 
-                if action_type == 1:
+                if action_type == 0: # BUY
                     sl = current_price - (atr * sl_multiplier)
                     tp = current_price + (atr * tp_multiplier)
                     trade_type = 'LONG'
-                else:
+                else: # SELL
                     sl = current_price + (atr * sl_multiplier)
                     tp = current_price - (atr * tp_multiplier)
                     trade_type = 'SHORT'
@@ -441,7 +487,7 @@ class LiveTrader:
                 else:
                     self.logger.warning(f"Invalid lot size calculated: {lot_size}")
             else:
-                self.logger.debug("Model decision: HOLD")
+                self.logger.warning(f"Failed to generate observation for {ticker}")
 
         except Exception as e:
             self.logger.error(f"Error handling new candle for {ticker}: {e}")
@@ -538,6 +584,10 @@ class LiveTrader:
                 self.logger.error("Restart attempt: Failed to initialize components")
                 self._restart_backoff_seconds = min(self._restart_backoff_seconds * 2, self._restart_backoff_max_seconds)
                 return False
+
+            # Reset LSTM states on restart
+            self.lstm_states = {}
+            self.episode_starts = {}
 
             self.consecutive_errors = 0
             self._restart_backoff_seconds = 1

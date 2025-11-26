@@ -12,7 +12,7 @@ import torch
 import gc
 from pathlib import Path
 
-from stable_baselines3 import PPO
+from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 from stable_baselines3.common.callbacks import BaseCallback
@@ -147,9 +147,9 @@ def train_phase_1(ticker, df, num_envs, timesteps):
     env = create_phase_env(df, phase=1, num_envs=num_envs)
     
     # Create new model
-    logger.info("Creating new PPO model for Phase 1")
-    model = PPO(
-        "MultiInputPolicy",
+    logger.info("Creating new RecurrentPPO (LSTM) model for Phase 1")
+    model = RecurrentPPO(
+        "MultiInputLstmPolicy",  # <--- CHANGED POLICY NAME
         env,
         verbose=1,
         device=device,
@@ -227,7 +227,7 @@ def train_phase_2(ticker, df, num_envs, timesteps, phase1_model_path):
     
     # Load Phase 1 weights
     logger.info(f"Loading Phase 1 weights from: {phase1_model_path}")
-    model = PPO.load(
+    model = RecurrentPPO.load(   # <--- CHANGED TO RecurrentPPO
         str(phase1_model_path),
         env=env,
         device=device
@@ -305,7 +305,7 @@ def train_phase_3(ticker, df, num_envs, timesteps, phase2_model_path):
     
     # Load Phase 2 weights
     logger.info(f"Loading Phase 2 weights from: {phase2_model_path}")
-    model = PPO.load(
+    model = RecurrentPPO.load(   # <--- CHANGED TO RecurrentPPO
         str(phase2_model_path),
         env=env,
         device=device
