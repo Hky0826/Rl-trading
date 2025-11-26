@@ -1,5 +1,5 @@
 # File: backtester.py
-# Description: Complete backtester with P&L Sync Fix (References vs Copies)
+# Description: Complete backtester with Phase Support
 # =============================================================================
 import pandas as pd
 import numpy as np
@@ -7,7 +7,8 @@ import logging
 import os
 import glob
 import json
-#from openpyxl import load_workbook
+import re
+from openpyxl import load_workbook
 from tqdm import tqdm
 from stable_baselines3 import PPO
 import multiprocessing
@@ -34,34 +35,61 @@ def safe_value(x, default=0.0, clip_min=-1e12, clip_max=1e12):
     return float(np.clip(x, clip_min, clip_max))
 
 
+def detect_phase_from_model_name(model_name):
+    """
+    Detect which phase a model belongs to based on filename.
+    
+    Returns:
+        int: Phase number (1, 2, or 3), defaults to 3 if unclear
+    """
+    model_name_lower = model_name.lower()
+    
+    # Check for explicit phase naming
+    if 'phase1' in model_name_lower or 'phase_1' in model_name_lower:
+        return 1
+    elif 'phase2' in model_name_lower or 'phase_2' in model_name_lower:
+        return 2
+    elif 'phase3' in model_name_lower or 'phase_3' in model_name_lower:
+        return 3
+    
+    # Try to extract phase number from patterns like "phaseN_"
+    phase_match = re.search(r'phase(\d)', model_name_lower)
+    if phase_match:
+        return int(phase_match.group(1))
+    
+    # Default to Phase 3 (full autonomy) for non-curriculum models
+    logger.debug(f"Could not detect phase for {model_name}, defaulting to Phase 3")
+    return 3
+
+
 def run_rl_backtest_with_tracking(data_df, model, ticker, model_name=""):
     """
     Run backtest using TradingEnv with detailed trade tracking.
+    Always uses Phase 3 environment for consistent backtesting.
     """
     try:
-        # Create environment
-        env = TradingEnv(data_df)
+        # ALWAYS use Phase 3 for backtesting (full autonomy)
+        phase = 3
+        logger.info(f"Backtesting {model_name} using Phase 3 environment (full autonomy)")
+        
+        # Create environment with Phase 3
+        env = TradingEnv(data_df, phase=phase)
         
         # Setup trade tracking via monkey-patching
         detailed_trades = []
-        equity_changes = []  # Track every equity change
+        equity_changes = []
         original_update = env._update_portfolio
         
         def tracked_update():
             """Intercept position updates to capture trade details directly from Env"""
             equity_before = env.equity
-            
-            # CRITICAL FIX: Store REFERENCES to the objects, not copies.
-            # This allows us to see the 'realized_pnl' that the env writes to them.
             positions_before_refs = list(env.open_positions)
             
-            # Run the actual environment update (The Source of Truth)
-            # This modifies the objects in positions_before_refs IN-PLACE
-            pnl, num_closed = original_update()
+            # Call original method - now returns 3 values
+            pnl, num_closed, closed_positions_from_env = original_update()
             
             equity_after = env.equity
             
-            # Track equity change
             equity_changes.append({
                 'step': env.current_step,
                 'equity_before': equity_before,
@@ -71,22 +99,17 @@ def run_rl_backtest_with_tracking(data_df, model, ticker, model_name=""):
                 'num_closed': num_closed
             })
             
-            # Find closed positions by checking which objects are no longer in env.open_positions
-            current_ids = {id(p) for p in env.open_positions}
-            closed_positions = [p for p in positions_before_refs if id(p) not in current_ids]
-            
-            if closed_positions:
+            # Use the closed_positions returned by the environment
+            if closed_positions_from_env:
                 current_idx = max(0, min(len(env.close_prices) - 1, int(env.current_step - 1)))
                 current_time = data_df.index[current_idx]
                 
-                for pos in closed_positions:
-                    # DIRECT READ from the Environment's calculation
-                    # The env writes 'realized_pnl', 'exit_price', and 'exit_reason' to the dict before closing
+                for pos in closed_positions_from_env:
                     trade_pnl = pos.get('realized_pnl', 0.0)
                     exit_price = pos.get('exit_price', pos['price'])
                     exit_reason = pos.get('exit_reason', 'Force Close')
                     
-                    # Sanity check: If Env didn't write PnL (e.g. forced close outside update), calculate it
+                    # Sanity check fallback
                     if 'realized_pnl' not in pos:
                         contract_size = getattr(config, 'CONTRACT_SIZE', 100000)
                         if pos['type'] == 'LONG':
@@ -111,7 +134,9 @@ def run_rl_backtest_with_tracking(data_df, model, ticker, model_name=""):
                         'risk_level': pos.get('risk_level'),
                         'rr_profile_index': pos.get('rr_profile_index')
                     })
-            return pnl, num_closed
+            
+            # Return the same 3 values
+            return pnl, num_closed, closed_positions_from_env
         
         env._update_portfolio = tracked_update
         
@@ -120,15 +145,12 @@ def run_rl_backtest_with_tracking(data_df, model, ticker, model_name=""):
         equity_curve = []
         total_steps = len(data_df) - env.lookback_window - 1
         
-        # Debug: Track equity changes
         debug_log = []
         
         for step in range(total_steps):
             try:
-                # Record equity BEFORE action
                 current_time = data_df.index[env.current_step - 1] if env.current_step > 0 else None
                 
-                # Calculate current equity including floating P&L
                 floating_pnl = env._calculate_floating_pnl()
                 current_equity = env.equity + floating_pnl
                 
@@ -137,7 +159,6 @@ def run_rl_backtest_with_tracking(data_df, model, ticker, model_name=""):
                     'Equity': safe_value(current_equity)
                 })
                 
-                # Debug logging
                 if step % 100 == 0 or env.equity < 0:
                     debug_log.append({
                         'step': step,
@@ -146,11 +167,9 @@ def run_rl_backtest_with_tracking(data_df, model, ticker, model_name=""):
                         'total_equity': current_equity
                     })
                 
-                # Get action and step
                 action, _ = model.predict(obs, deterministic=True)
                 obs, reward, terminated, truncated, _ = env.step(action)
                 
-                # Sanitize observation
                 if isinstance(obs, dict):
                     for key in obs:
                         obs[key] = np.nan_to_num(obs[key], nan=0.0, posinf=1e9, neginf=-1e9)
@@ -176,17 +195,17 @@ def run_rl_backtest_with_tracking(data_df, model, ticker, model_name=""):
         
         # Debug output
         if debug_log:
-            logger.info(f"=== DEBUG EQUITY TRACKING for {model_name} ===")
+            logger.info(f"=== DEBUG EQUITY TRACKING for {model_name} (Phase 3) ===")
             logger.info(f"Initial equity: {config.INITIAL_EQUITY}")
             logger.info(f"Final env.equity: {env.equity}")
             
             if detailed_trades:
                 total_trade_pnl = sum([t['pnl'] for t in detailed_trades])
-                logger.info(f"Sum of all trade P&L (Backtester Sync): {total_trade_pnl}")
+                logger.info(f"Sum of all trade P&L: {total_trade_pnl}")
             
             if equity_changes:
                 total_equity_delta = sum([ec['equity_delta'] for ec in equity_changes])
-                logger.info(f"Total equity delta from changes (Env Truth): {total_equity_delta:.2f}")
+                logger.info(f"Total equity delta: {total_equity_delta:.2f}")
                 
                 if abs(total_trade_pnl - total_equity_delta) > 1.0:
                      logger.warning(f"⚠️ MISMATCH: Trade P&L ({total_trade_pnl}) != Equity Delta ({total_equity_delta})")
@@ -203,7 +222,6 @@ def run_rl_backtest_with_tracking(data_df, model, ticker, model_name=""):
             drawdown = (equity_df['Equity'] - peak) / peak
             max_drawdown = -safe_value(drawdown.min(), default=0) * 100
             
-            # Calculate consecutive drawdown days
             equity_df_copy = equity_df.copy()
             equity_df_copy['Date'] = pd.to_datetime(equity_df_copy['Time']).dt.date
             
@@ -269,7 +287,6 @@ def generate_trade_breakdown(trades_df, model_name):
             total_pnl = group['pnl'].sum()
             avg_pnl = group['pnl'].mean()
             
-            # Get RR profile details
             rr_index_int = int(rr_index)
             if rr_index_int < len(config.RR_PROFILES):
                 sl_mult, tp_mult = config.RR_PROFILES[rr_index_int]
@@ -301,7 +318,6 @@ def save_comprehensive_results(all_results, ticker):
     
     excel_file = os.path.join(results_dir, f"{ticker}_backtest_results_{timestamp}.xlsx")
     
-    # Prepare data for Excel
     summary_data = []
     all_trades_data = []
     all_equity_data = []
@@ -311,22 +327,18 @@ def save_comprehensive_results(all_results, ticker):
     for res in all_results:
         model_name = res['model_name']
         
-        # Summary data
         summary_data.append({
             'Model': model_name,
             **res['metrics']
         })
         
-        # All trades with model identifier
         if not res['trades'].empty:
             trades_with_model = res['trades'].copy()
             trades_with_model['Model'] = model_name
             all_trades_data.append(trades_with_model)
             
-            # Generate trade breakdowns
             breakdown = generate_trade_breakdown(res['trades'], model_name)
             
-            # Risk level breakdown
             for risk_level, data in breakdown['by_risk_level'].items():
                 risk_breakdown_data.append({
                     'Model': model_name,
@@ -339,7 +351,6 @@ def save_comprehensive_results(all_results, ticker):
                     'Avg_PnL': data['avg_pnl']
                 })
             
-            # RR profile breakdown
             for rr_index, data in breakdown['by_rr_profile'].items():
                 rr_breakdown_data.append({
                     'Model': model_name,
@@ -355,45 +366,37 @@ def save_comprehensive_results(all_results, ticker):
                     'Avg_PnL': data['avg_pnl']
                 })
         
-        # Equity curves with model identifier
         if not res['equity_curve'].empty:
             equity_with_model = res['equity_curve'].copy()
             equity_with_model['Model'] = model_name
             all_equity_data.append(equity_with_model)
     
-    # Create comprehensive Excel file
     try:
         with pd.ExcelWriter(excel_file, engine='openpyxl') as writer:
-            # 1. Summary sheet - sorted by Calmar Ratio
             summary_df = pd.DataFrame(summary_data)
             summary_df = summary_df.sort_values(by="Calmar Ratio", ascending=False)
             summary_df.to_excel(writer, sheet_name='Summary', index=False)
             
-            # 2. All trades in one sheet
             if all_trades_data:
                 all_trades_df = pd.concat(all_trades_data, ignore_index=True)
                 cols = ['Model'] + [col for col in all_trades_df.columns if col != 'Model']
                 all_trades_df = all_trades_df[cols]
                 all_trades_df.to_excel(writer, sheet_name='All_Trades', index=False)
             
-            # 3. All equity curves in one sheet
             if all_equity_data:
                 all_equity_df = pd.concat(all_equity_data, ignore_index=True)
                 cols = ['Model'] + [col for col in all_equity_df.columns if col != 'Model']
                 all_equity_df = all_equity_df[cols]
                 all_equity_df.to_excel(writer, sheet_name='All_Equity_Curves', index=False)
             
-            # 4. Risk level breakdown for all models
             if risk_breakdown_data:
                 risk_df = pd.DataFrame(risk_breakdown_data)
                 risk_df.to_excel(writer, sheet_name='Risk_Level_Breakdown', index=False)
             
-            # 5. RR profile breakdown for all models
             if rr_breakdown_data:
                 rr_df = pd.DataFrame(rr_breakdown_data)
                 rr_df.to_excel(writer, sheet_name='RR_Profile_Breakdown', index=False)
             
-            # 6. Metadata sheet
             metadata_data = {
                 'Parameter': [
                     'Timestamp', 'Ticker', 'Total Models Tested', 'Initial Equity',
@@ -415,7 +418,6 @@ def save_comprehensive_results(all_results, ticker):
             metadata_df = pd.DataFrame(metadata_data)
             metadata_df.to_excel(writer, sheet_name='Metadata', index=False)
             
-            # 7. Top performers summary
             if len(summary_df) > 0:
                 top_performers_data = []
                 metrics_to_rank = ['Calmar Ratio', 'Profit Factor', 'Total Return (%)', 'Win Rate (%)', 'Sharpe Ratio (Annualized)']
@@ -434,6 +436,29 @@ def save_comprehensive_results(all_results, ticker):
         
         logger.info(f"✅ Comprehensive Excel file saved: {excel_file}")
         
+        try:
+            wb = load_workbook(excel_file)
+            
+            for sheet_name in wb.sheetnames:
+                sheet = wb[sheet_name]
+                for column in sheet.columns:
+                    max_length = 0
+                    column_letter = column[0].column_letter
+                    for cell in column:
+                        try:
+                            if len(str(cell.value)) > max_length:
+                                max_length = len(str(cell.value))
+                        except:
+                            pass
+                    adjusted_width = min(max_length + 2, 50)
+                    sheet.column_dimensions[column_letter].width = adjusted_width
+            
+            wb.save(excel_file)
+            logger.info("✅ Excel column widths auto-adjusted")
+            
+        except Exception as e:
+            logger.warning(f"Could not auto-adjust Excel column widths: {e}")
+        
     except Exception as e:
         logger.error(f"Could not create Excel report: {e}")
         logger.error(traceback.format_exc())
@@ -448,13 +473,10 @@ def backtest_worker(model_path, data_path, ticker):
         model_name = os.path.basename(model_path)
         logger.info(f"Starting backtest for: {model_name}")
         
-        # Load data
         backtest_df = pd.read_parquet(data_path)
         
-        # Load model
         model = PPO.load(model_path, device="cpu")
         
-        # Run backtest with tracking
         equity_curve, trades, max_drawdown, max_consecutive_dd_days = run_rl_backtest_with_tracking(
             backtest_df, model, ticker, model_name
         )
@@ -478,13 +500,7 @@ def backtest_worker(model_path, data_path, ticker):
         return None
 
 def save_best_model_name(model_name: str, file_path: str = "best_model.json"):
-    """
-    Save the best model name to a JSON file.
-    
-    Args:
-        model_name (str): The name or path of the best model.
-        file_path (str): File path for the JSON file (default: 'best_model.json').
-    """
+    """Save the best model name to a JSON file."""
     data = {"best_model": model_name}
     
     try:
@@ -501,11 +517,11 @@ def main():
     
     logger.info("=" * 80)
     logger.info("🚀 COMPREHENSIVE RL BACKTESTER")
+    logger.info("📊 All models tested with Phase 3 environment (full autonomy)")
     logger.info("=" * 80)
     
     ticker = config.TICKERS[0]
     
-    # Check for processed data
     processed_data_path = os.path.join("processed_data", f"{ticker}_processed.parquet")
     if not os.path.exists(processed_data_path):
         logger.critical(f"❌ Processed data not found at {processed_data_path}")
@@ -514,7 +530,6 @@ def main():
     
     logger.info(f"✅ Found processed data: {processed_data_path}")
     
-    # Find all model files
     model_dir = config.RL_MODEL_DIR
     model_paths = [
         p for p in glob.glob(os.path.join(model_dir, "*.zip"))
@@ -522,17 +537,15 @@ def main():
     
     if not model_paths:
         logger.error(f"❌ No candidate models found in '{model_dir}'")
-        logger.info("Looking for files matching: *.zip (excluding 'final')")
+        logger.info("Looking for files matching: *.zip")
         return
     
     logger.info(f"✅ Found {len(model_paths)} candidate models")
     
-    # Setup multiprocessing
     num_processes = min(8, os.cpu_count())
     logger.info(f"🔄 Using {num_processes} parallel processes")
     logger.info("=" * 80)
     
-    # Run backtests in parallel
     try:
         with multiprocessing.Pool(processes=num_processes) as pool:
             worker_func = partial(backtest_worker, data_path=processed_data_path, ticker=ticker)
@@ -555,13 +568,10 @@ def main():
     
     logger.info(f"\n✅ Successfully backtested {len(all_results)}/{len(model_paths)} models")
     
-    # Sort results by Calmar Ratio
     all_results.sort(key=lambda x: x['metrics'].get("Calmar Ratio", -999), reverse=True)
     
-    # Save comprehensive results
-    #excel_path = save_comprehensive_results(all_results, ticker)
+    excel_path = save_comprehensive_results(all_results, ticker)
     
-    # Display summary
     summary_data = []
     for res in all_results:
         summary_data.append({'model_name': res['model_name'], **res['metrics']})
@@ -578,7 +588,6 @@ def main():
     print(results_df.head(10).reindex(columns=summary_columns).fillna(0).to_string(index=False))
     print("="*120)
     
-    # Best model details
     if not results_df.empty:
         best_model_info = results_df.iloc[0]
         best_result = all_results[0]
@@ -596,34 +605,12 @@ def main():
         print(f"  🎯 Total Trades: {int(best_model_info['Total Trades'])}")
         print("=" * 80)
         
-        # Show breakdown for best model
         if not best_result['trades'].empty:
             breakdown_report = reporting.format_performance_breakdown(best_result['trades'])
             print(breakdown_report)
         
         print(f"\n💡 ACTION: Consider using '{best_model_info['model_name']}' for live trading")
-        #print(f"📁 Results saved to: {excel_path}")
         print(f"📊 Excel includes: Summary, All Trades, Equity Curves, Risk/RR Breakdowns, Top Performers")
-        
-        # Plot equity curve for best model
-        """try:     
-            equity_curve = best_result['equity_curve']
-            plt.figure(figsize=(14, 7))
-            plt.plot(equity_curve['Time'], equity_curve['Equity'], label='Equity Curve', linewidth=2, color='blue')
-            plt.axhline(y=config.INITIAL_EQUITY, color='red', linestyle='--', alpha=0.5, label='Initial Equity')
-            plt.title(f"Equity Curve - Best Model: {best_model_info['model_name']}", fontsize=14, fontweight='bold')
-            plt.xlabel("Time", fontsize=12)
-            plt.ylabel("Equity ($)", fontsize=12)
-            plt.legend(fontsize=10)
-            plt.grid(True, alpha=0.3)
-            plt.tight_layout()
-            
-            plot_path = os.path.join("backtest_results", f"best_model_equity_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
-            plt.savefig(plot_path, dpi=150)
-            logger.info(f"📈 Best model equity plot saved: {plot_path}")
-            plt.show()
-        except Exception as e:
-            logger.warning(f"Could not generate plot: {e}")"""
     
     logger.info("\n" + "=" * 80)
     logger.info("✅ BACKTESTING COMPLETE!")
@@ -631,7 +618,6 @@ def main():
 
 
 if __name__ == '__main__':
-    # Setup multiprocessing
     try:
         multiprocessing.set_start_method('spawn', force=True)
     except RuntimeError:
