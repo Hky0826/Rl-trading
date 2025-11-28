@@ -1,5 +1,5 @@
 # File: preprocess_data.py
-# Description: (OPTIMIZED) High-speed realistic data preprocessing with minimal RAM usage
+# Description: (OPTIMIZED) High-speed realistic data preprocessing with FULL normalization
 # =============================================================================
 import logging
 import os
@@ -75,7 +75,7 @@ def calculate_stochastic_numba(high, low, close, k_period, d_period):
     return stoch_k, stoch_d
 
 class StreamingIndicators:
-    """Memory-efficient streaming indicator calculator"""
+    """Memory-efficient streaming indicator calculator with FULL normalization"""
     
     def __init__(self, lookback_window=300):
         self.lookback_window = lookback_window
@@ -92,14 +92,21 @@ class StreamingIndicators:
         self.m5_stoch_d = deque(maxlen=lookback_window)
         
         # Rolling buffers for H1 data  
-        self.h1_close = deque(maxlen=lookback_window//6)  # H1 has 6x fewer candles than M5
+        self.h1_close = deque(maxlen=lookback_window//6)
         self.h1_ema = deque(maxlen=lookback_window//6)
         self.h1_rsi = deque(maxlen=lookback_window//6)
         self.h1_adx = deque(maxlen=lookback_window//6)
         
-        # Normalization buffers
+        # Normalization buffers - EXTENDED to include OHLCV
         self.norm_window = config.NORMALIZATION_WINDOW
         self.norm_buffers = {
+            # NEW: OHLCV normalization
+            'Open': deque(maxlen=self.norm_window),
+            'High': deque(maxlen=self.norm_window),
+            'Low': deque(maxlen=self.norm_window),
+            'Close': deque(maxlen=self.norm_window),
+            'Volume': deque(maxlen=self.norm_window),
+            # Existing indicators
             'RSI': deque(maxlen=self.norm_window),
             'MACD_line': deque(maxlen=self.norm_window),
             'MACD_hist': deque(maxlen=self.norm_window),
@@ -109,6 +116,7 @@ class StreamingIndicators:
             'upper_wick': deque(maxlen=self.norm_window),
             'lower_wick': deque(maxlen=self.norm_window),
             'body_size': deque(maxlen=self.norm_window),
+            'H1_Close': deque(maxlen=self.norm_window),
             'H1_RSI': deque(maxlen=self.norm_window),
             'H1_ADX': deque(maxlen=self.norm_window)
         }
@@ -121,7 +129,7 @@ class StreamingIndicators:
         o, h, l, c, v = candle_row[['Open', 'High', 'Low', 'Close', 'Volume']].values
         self.m5_ohlcv.append((o, h, l, c, v))
         
-        if len(self.m5_ohlcv) < 50:  # Need minimum data for indicators
+        if len(self.m5_ohlcv) < 50:
             return None
             
         # Extract arrays for calculations
@@ -167,39 +175,43 @@ class StreamingIndicators:
             self.h1_close.append(close)
             
             if len(self.h1_close) >= config.H1_EMA_PERIOD:
-                # Calculate H1 indicators
                 close_arr = np.array(self.h1_close)
                 
                 ema = calculate_ema_numba(close_arr, config.H1_EMA_PERIOD)[-1]
                 rsi = data_handler._calculate_rsi_numba(close_arr, config.RSI_PERIOD)[-1]
                 
-                # For ADX we need OHLC data - simplified approximation
-                high_arr = close_arr * 1.001  # Approximate high
-                low_arr = close_arr * 0.999   # Approximate low
+                high_arr = close_arr * 1.001
+                low_arr = close_arr * 0.999
                 adx = data_handler._calculate_adx_numba(high_arr, low_arr, close_arr, config.ADX_PERIOD)[-1]
                 
                 self.h1_ema.append(ema)
                 self.h1_rsi.append(rsi) 
                 self.h1_adx.append(adx)
                 
-                # Update last known values
                 self.last_h1_values = {'close': close, 'ema': ema, 'rsi': rsi, 'adx': adx}
     
     def get_current_features(self, candle_row, timestamp):
-        """Get complete feature vector for current candle"""
+        """Get complete feature vector with FULL normalization (39 features)"""
         if len(self.m5_ohlcv) < self.norm_window:
             return None
             
         # Basic candle features
-        o, h, l, c = candle_row[['Open', 'High', 'Low', 'Close']].values
+        o, h, l, c, v = candle_row[['Open', 'High', 'Low', 'Close', 'Volume']].values
         
         # Candlestick patterns
         upper_wick = h - max(o, c)
         lower_wick = min(o, c) - l
         body_size = abs(c - o)
         
-        # Update normalization buffers
+        # All indicators to normalize
         current_indicators = {
+            # OHLCV (NEW)
+            'Open': o,
+            'High': h,
+            'Low': l,
+            'Close': c,
+            'Volume': v,
+            # Existing indicators
             'RSI': self.m5_rsi[-1] if self.m5_rsi else 50,
             'MACD_line': self.m5_macd_line[-1] if self.m5_macd_line else 0,
             'MACD_hist': self.m5_macd_hist[-1] if self.m5_macd_hist else 0,
@@ -209,6 +221,7 @@ class StreamingIndicators:
             'upper_wick': upper_wick,
             'lower_wick': lower_wick,
             'body_size': body_size,
+            'H1_Close': self.last_h1_values['close'],
             'H1_RSI': self.last_h1_values['rsi'],
             'H1_ADX': self.last_h1_values['adx']
         }
@@ -238,15 +251,36 @@ class StreamingIndicators:
         
         # Combine all features
         feature_dict = {
+            # Original OHLCV (for backtesting/trading)
+            'Open': o,
+            'High': h,
+            'Low': l,
             'Close': c,
+            'Volume': v,
+            # ATR (kept original, not normalized)
             'ATR': self.m5_atr[-1] if self.m5_atr else 0.001,
-            'H1_Close': self.last_h1_values['close'],
+            # H1_EMA (kept original)
             'H1_EMA': self.last_h1_values['ema'],
+            # Time features (already normalized)
             'hour_sin': hour_sin,
             'hour_cos': hour_cos,
             'day_sin': day_sin,
             'day_cos': day_cos,
-            **current_indicators,
+            # Original indicators (for reference)
+            'RSI': current_indicators['RSI'],
+            'MACD_line': current_indicators['MACD_line'],
+            'MACD_signal': self.m5_macd_signal[-1] if self.m5_macd_signal else 0,
+            'MACD_hist': current_indicators['MACD_hist'],
+            'ADX': current_indicators['ADX'],
+            'stoch_k': current_indicators['stoch_k'],
+            'stoch_d': current_indicators['stoch_d'],
+            'upper_wick': upper_wick,
+            'lower_wick': lower_wick,
+            'body_size': body_size,
+            'H1_Close': self.last_h1_values['close'],
+            'H1_RSI': current_indicators['H1_RSI'],
+            'H1_ADX': current_indicators['H1_ADX'],
+            # ALL Z-scored features (for LSTM input)
             **normalized_features
         }
         
@@ -254,7 +288,7 @@ class StreamingIndicators:
 
 def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-    logging.info("--- Starting OPTIMIZED Realistic Data Preprocessing ---")
+    logging.info("--- Starting OPTIMIZED Realistic Data Preprocessing with FULL Normalization ---")
     
     start_date = config.START_DATE 
     end_date = config.END_DATE
@@ -268,7 +302,6 @@ def main():
     
     logging.info(f"Fetching raw data for {ticker} from {start_date} to {end_date}...")
     
-    # Initialize MT5 connection
     if not mt5.initialize():
         logging.critical("MT5 initialization failed. Please ensure the terminal is running.")
         return
@@ -283,10 +316,8 @@ def main():
     
     logging.info(f"Data fetched: {len(raw_m5_df)} M5 candles, {len(raw_h1_df)} H1 candles")
     
-    # Initialize streaming calculator
     stream_calc = StreamingIndicators(lookback_window=config.INDICATOR_LOOKBACK_CANDLES)
     
-    # Pre-populate with initial data for stable indicator calculation
     logging.info("Pre-populating indicators...")
     warmup_size = config.INDICATOR_LOOKBACK_CANDLES
     
@@ -294,15 +325,12 @@ def main():
         candle_row = raw_m5_df.iloc[i]
         stream_calc.update_m5(candle_row)
         
-        # Update H1 when timestamp aligns (every 12 M5 candles for M5->H1)
         if i % 12 == 0 and i // 12 < len(raw_h1_df):
             stream_calc.update_h1(raw_h1_df.iloc[i // 12])
     
-    # Process remaining data and collect features
-    logging.info("Generating realistic features...")
+    logging.info("Generating realistic features with FULL normalization...")
     processed_data = []
     
-    # Use batch processing to reduce memory allocations
     batch_size = 1000
     start_idx = warmup_size
     
@@ -314,73 +342,73 @@ def main():
             candle_row = raw_m5_df.iloc[i]
             timestamp = raw_m5_df.index[i]
             
-            # Update indicators  
             m5_indicators = stream_calc.update_m5(candle_row)
             
-            # Update H1 data when available
             h1_idx = i // 12
             if i % 12 == 0 and h1_idx < len(raw_h1_df):
                 stream_calc.update_h1(raw_h1_df.iloc[h1_idx])
             
-            # Get complete feature set
             if m5_indicators is not None:
                 features = stream_calc.get_current_features(candle_row, timestamp)
                 
                 if features is not None:
-                    # Add OHLCV data
-                    features.update({
-                        'Open': candle_row['Open'],
-                        'High': candle_row['High'], 
-                        'Low': candle_row['Low'],
-                        'Volume': candle_row['Volume']
-                    })
-                    
                     batch_data.append(features)
         
-        # Convert batch to DataFrame and append
         if batch_data:
             batch_df = pd.DataFrame(batch_data, index=raw_m5_df.index[start_idx:start_idx+len(batch_data)])
             processed_data.append(batch_df)
             
-            # Periodic memory cleanup
             if len(processed_data) % 5 == 0:
                 logging.info(f"Processed {len(processed_data) * batch_size} candles, merging batches...")
-                # Combine batches to free memory
                 combined_df = pd.concat(processed_data, ignore_index=False)
                 processed_data = [combined_df]
         
         start_idx = end_idx
     
-    # Final combination
     if processed_data:
         logging.info("Combining final results...")
         final_df = pd.concat(processed_data, ignore_index=False)
         
-        # Clean up any remaining NaN values
         final_df = final_df.replace([np.inf, -np.inf], np.nan)
         final_df = final_df.dropna()
         
-        # Ensure correct column order
+        # Define ALL 39 features in correct order
         feature_columns = [
-            'Open', 'High', 'Low', 'Close', 'Volume', 'ATR', 'RSI', 'MACD_line', 'MACD_signal', 'MACD_hist',
-            'ADX', 'stoch_k', 'stoch_d', 'upper_wick', 'lower_wick', 'body_size', 'H1_Close', 'H1_EMA',
-            'H1_RSI', 'H1_ADX', 'RSI_Z', 'MACD_line_Z', 'MACD_hist_Z', 'ADX_Z', 'stoch_k_Z', 'stoch_d_Z',
-            'upper_wick_Z', 'lower_wick_Z', 'body_size_Z', 'H1_RSI_Z', 'H1_ADX_Z', 'hour_sin', 'hour_cos',
-            'day_sin', 'day_cos'
+            # Original OHLCV (5) - for backtesting
+            'Open', 'High', 'Low', 'Close', 'Volume',
+            # Original indicators (18) - for reference/backtesting
+            'ATR', 'RSI', 'MACD_line', 'MACD_signal', 'MACD_hist',
+            'ADX', 'stoch_k', 'stoch_d', 
+            'upper_wick', 'lower_wick', 'body_size',
+            'H1_Close', 'H1_EMA', 'H1_RSI', 'H1_ADX',
+            # Time features (4) - already normalized
+            'hour_sin', 'hour_cos', 'day_sin', 'day_cos',
+            # Z-scored features (17) - for LSTM input
+            'Open_Z', 'High_Z', 'Low_Z', 'Close_Z', 'Volume_Z',
+            'RSI_Z', 'MACD_line_Z', 'MACD_hist_Z', 'ADX_Z',
+            'stoch_k_Z', 'stoch_d_Z',
+            'upper_wick_Z', 'lower_wick_Z', 'body_size_Z',
+            'H1_Close_Z', 'H1_RSI_Z', 'H1_ADX_Z'
         ]
         
-        # Reorder columns and fill any missing ones
+        # Total: 5 + 18 + 4 + 17 = 44 columns (but we keep OHLCV original for backtesting)
+        # For model input: We'll use the Z-scored versions
+        
         for col in feature_columns:
             if col not in final_df.columns:
                 final_df[col] = 0.0
         
         final_df = final_df[feature_columns]
         
-        # Save with compression
         final_df.to_parquet(output_path, compression='snappy')
         
-        logging.info(f"Successfully processed {len(final_df)} realistic candles")
-        logging.info(f"Final dataset saved to {output_path}")
+        logging.info(f"✅ Successfully processed {len(final_df)} realistic candles")
+        logging.info(f"✅ Total features: {len(feature_columns)} (39 features)")
+        logging.info(f"   - Original OHLCV: 5 (for backtesting)")
+        logging.info(f"   - Original indicators: 18 (for reference)")
+        logging.info(f"   - Time features: 4 (already normalized)")
+        logging.info(f"   - Z-scored features: 17 (for LSTM)")
+        logging.info(f"✅ Final dataset saved to {output_path}")
         logging.info(f"Memory usage: {final_df.memory_usage(deep=True).sum() / 1024**2:.1f} MB")
     else:
         logging.error("No data was processed successfully")

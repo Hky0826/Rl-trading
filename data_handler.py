@@ -1,5 +1,5 @@
 # File: data_handler.py
-# Description: Optimized indicator calculations with Numba - FULL FEATURE SET
+# Description: Indicator calculations with FULL normalization support
 # =============================================================================
 import pandas as pd
 import numpy as np
@@ -44,7 +44,6 @@ def _calculate_rsi_numba(close, period):
     gain = np.zeros(n)
     loss = np.zeros(n)
 
-    # manual diff (avoids np.diff)
     for i in range(1, n):
         delta = close[i] - close[i - 1]
         if delta > 0:
@@ -210,21 +209,18 @@ def fetch_live_data(ticker, num_candles=300):
         return None, None
 
 # ===============================
-# Indicator preparation - FULL FEATURE SET
+# Indicator preparation with FULL normalization
 # ===============================
 
 def prepare_indicators(data_m5, data_h1):
     """
-    Prepare all indicators for the FULL FEATURE SET (35 features).
+    Prepare all indicators with FULL normalization support (39 features).
     
-    Features generated:
-    - OHLCV: Open, High, Low, Close, Volume
-    - M5 Indicators: ATR, RSI, MACD_line, MACD_signal, MACD_hist, ADX, stoch_k, stoch_d
-    - Candle patterns: upper_wick, lower_wick, body_size
-    - H1 features: H1_Close, H1_EMA, H1_RSI, H1_ADX
-    - Z-scored: RSI_Z, MACD_line_Z, MACD_hist_Z, ADX_Z, stoch_k_Z, stoch_d_Z,
-                upper_wick_Z, lower_wick_Z, body_size_Z, H1_RSI_Z, H1_ADX_Z
-    - Time features: hour_sin, hour_cos, day_sin, day_cos
+    Returns DataFrame with:
+    - Original OHLCV (5) - for trading logic
+    - Original indicators (18) - for reference
+    - Time features (4) - already normalized
+    - Z-scored features (17) - for LSTM input
     """
     df = data_m5.copy()
     h1_df = data_h1.copy()
@@ -240,27 +236,17 @@ def prepare_indicators(data_m5, data_h1):
     # M5 Timeframe Indicators
     # ============================================
     
-    # ATR
     df['ATR'] = _calculate_atr_numba(df['High'].values, df['Low'].values, df['Close'].values, config.M5_ATR_PERIOD)
-    
-    # RSI
     df['RSI'] = _calculate_rsi_numba(df['Close'].values, config.RSI_PERIOD)
 
-    # MACD (Fast EMA - Slow EMA)
     ma_fast = df['Close'].ewm(span=config.MA_FAST_PERIOD, adjust=False).mean()
     ma_slow = df['Close'].ewm(span=config.MA_SLOW_PERIOD, adjust=False).mean()
     df['MACD_line'] = ma_fast - ma_slow
-    
-    # MACD Signal line (EMA of MACD line)
     df['MACD_signal'] = df['MACD_line'].ewm(span=config.MACD_SIGNAL_PERIOD, adjust=False).mean()
-    
-    # MACD Histogram (MACD line - Signal line)
     df['MACD_hist'] = df['MACD_line'] - df['MACD_signal']
 
-    # ADX
     df['ADX'] = _calculate_adx_numba(df['High'].values, df['Low'].values, df['Close'].values, config.ADX_PERIOD)
 
-    # Stochastic Oscillator
     low_k = df['Low'].rolling(window=config.STOCH_K_PERIOD).min()
     high_k = df['High'].rolling(window=config.STOCH_K_PERIOD).max()
     df['stoch_k'] = 100 * ((df['Close'] - low_k) / (high_k - low_k + 1e-9))
@@ -274,34 +260,51 @@ def prepare_indicators(data_m5, data_h1):
     df['body_size'] = (df['Close'] - df['Open']).abs()
 
     # ============================================
-    # Merge H1 features into M5 dataframe
+    # Merge H1 features
     # ============================================
     df['H1_Close'] = h1_df['Close'].reindex(df.index, method='ffill')
     df['H1_EMA'] = h1_df['H1_EMA'].reindex(df.index, method='ffill')
     df['H1_RSI'] = h1_df['H1_RSI'].reindex(df.index, method='ffill')
     df['H1_ADX'] = h1_df['H1_ADX'].reindex(df.index, method='ffill')
-
+    
     # ============================================
-    # Z-Score Normalization (rolling window)
+    # Z-Score Normalization - With Outlier Clipping
     # ============================================
     norm_window = config.NORMALIZATION_WINDOW
     
     features_to_normalize = [
+        # OHLCV
+        'Open', 'High', 'Low', 'Close', 'Volume',
+        # Existing indicators
         'RSI', 'MACD_line', 'MACD_hist', 'ADX',
         'stoch_k', 'stoch_d',
         'upper_wick', 'lower_wick', 'body_size',
-        'H1_RSI', 'H1_ADX'
+        'H1_Close', 'H1_RSI', 'H1_ADX'
     ]
     
     for col in features_to_normalize:
+        # Calculate Rolling Stats
         rolling_mean = df[col].rolling(window=norm_window, min_periods=1).mean()
         rolling_std = df[col].rolling(window=norm_window, min_periods=1).std()
-        # Avoid division by zero
+        
+        # Avoid division by zero/tiny numbers (fix for low volatility)
         rolling_std = rolling_std.replace(0, 1e-9)
-        df[f'{col}_Z'] = (df[col] - rolling_mean) / rolling_std
+        
+        # Calculate raw Z-score
+        z_score = (df[col] - rolling_mean) / rolling_std
+        
+        # CLIP the values:
+        # Any value > 4 becomes 4. Any value < -4 becomes -4.
+        # This prevents market shocks from breaking the LSTM gradients.
+        df[f'{col}_Z'] = z_score.clip(lower=-4.0, upper=4.0)
+
+    # Optional: Fill initial NaNs that result from the rolling window with 0
+    # (Since Z-score of 0 implies the "mean", this is a safe neutral fill)
+    z_cols = [f'{c}_Z' for c in features_to_normalize]
+    df[z_cols] = df[z_cols].fillna(0)
 
     # ============================================
-    # Time-based Features (cyclical encoding)
+    # Time-based Features
     # ============================================
     df['hour_sin'] = np.sin(2 * np.pi * df.index.hour / 23.0)
     df['hour_cos'] = np.cos(2 * np.pi * df.index.hour / 23.0)
@@ -311,23 +314,28 @@ def prepare_indicators(data_m5, data_h1):
     # ============================================
     # Cleanup
     # ============================================
-    # Replace inf/-inf with NaN, then drop NaN rows
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.dropna(inplace=True)
 
     # ============================================
-    # Validation - Ensure all 35 features exist
+    # Validation - 39 features total
     # ============================================
     required_features = [
-        'Open', 'High', 'Low', 'Close', 'Volume', 
+        # Original OHLCV (5)
+        'Open', 'High', 'Low', 'Close', 'Volume',
+        # Original indicators (18)
         'ATR', 'RSI', 'MACD_line', 'MACD_signal', 'MACD_hist',
-        'ADX', 'stoch_k', 'stoch_d', 
-        'upper_wick', 'lower_wick', 'body_size', 
-        'H1_Close', 'H1_EMA', 'H1_RSI', 'H1_ADX', 
-        'RSI_Z', 'MACD_line_Z', 'MACD_hist_Z', 'ADX_Z', 
-        'stoch_k_Z', 'stoch_d_Z', 'upper_wick_Z', 'lower_wick_Z', 'body_size_Z', 
-        'H1_RSI_Z', 'H1_ADX_Z', 
-        'hour_sin', 'hour_cos', 'day_sin', 'day_cos'
+        'ADX', 'stoch_k', 'stoch_d',
+        'upper_wick', 'lower_wick', 'body_size',
+        'H1_Close', 'H1_EMA', 'H1_RSI', 'H1_ADX',
+        # Time features (4)
+        'hour_sin', 'hour_cos', 'day_sin', 'day_cos',
+        # Z-scored features (17) - for LSTM
+        'Open_Z', 'High_Z', 'Low_Z', 'Close_Z', 'Volume_Z',
+        'RSI_Z', 'MACD_line_Z', 'MACD_hist_Z', 'ADX_Z',
+        'stoch_k_Z', 'stoch_d_Z',
+        'upper_wick_Z', 'lower_wick_Z', 'body_size_Z',
+        'H1_Close_Z', 'H1_RSI_Z', 'H1_ADX_Z'
     ]
     
     missing_features = [feat for feat in required_features if feat not in df.columns]
@@ -335,26 +343,32 @@ def prepare_indicators(data_m5, data_h1):
         logging.error(f"Missing required features after preparation: {missing_features}")
         raise ValueError(f"Missing required features: {missing_features}")
     
-    logging.info(f"Successfully prepared {len(required_features)} features for {len(df)} candles")
+    logging.info(f"Successfully prepared {len(required_features)} features (39 total) for {len(df)} candles")
+    logging.info(f"  - Original OHLCV: 5 (for trading logic)")
+    logging.info(f"  - Original indicators: 18 (for reference)")
+    logging.info(f"  - Time features: 4 (already normalized)")
+    logging.info(f"  - Z-scored features: 17 (for LSTM input)")
 
     return df
 
 
 def validate_feature_set(df):
     """
-    Validate that the dataframe contains all 35 required features.
+    Validate that the dataframe contains all 39 required features.
     Returns True if valid, raises ValueError if not.
     """
     required_features = [
-        'Open', 'High', 'Low', 'Close', 'Volume', 
+        'Open', 'High', 'Low', 'Close', 'Volume',
         'ATR', 'RSI', 'MACD_line', 'MACD_signal', 'MACD_hist',
-        'ADX', 'stoch_k', 'stoch_d', 
-        'upper_wick', 'lower_wick', 'body_size', 
-        'H1_Close', 'H1_EMA', 'H1_RSI', 'H1_ADX', 
-        'RSI_Z', 'MACD_line_Z', 'MACD_hist_Z', 'ADX_Z', 
-        'stoch_k_Z', 'stoch_d_Z', 'upper_wick_Z', 'lower_wick_Z', 'body_size_Z', 
-        'H1_RSI_Z', 'H1_ADX_Z', 
-        'hour_sin', 'hour_cos', 'day_sin', 'day_cos'
+        'ADX', 'stoch_k', 'stoch_d',
+        'upper_wick', 'lower_wick', 'body_size',
+        'H1_Close', 'H1_EMA', 'H1_RSI', 'H1_ADX',
+        'hour_sin', 'hour_cos', 'day_sin', 'day_cos',
+        'Open_Z', 'High_Z', 'Low_Z', 'Close_Z', 'Volume_Z',
+        'RSI_Z', 'MACD_line_Z', 'MACD_hist_Z', 'ADX_Z',
+        'stoch_k_Z', 'stoch_d_Z',
+        'upper_wick_Z', 'lower_wick_Z', 'body_size_Z',
+        'H1_Close_Z', 'H1_RSI_Z', 'H1_ADX_Z'
     ]
     
     missing = [feat for feat in required_features if feat not in df.columns]
@@ -362,17 +376,15 @@ def validate_feature_set(df):
     if missing:
         raise ValueError(f"Missing {len(missing)} required features: {missing}")
     
-    # Check for NaN values
     nan_counts = df[required_features].isnull().sum()
     if nan_counts.sum() > 0:
         logging.warning(f"NaN values found in features:\n{nan_counts[nan_counts > 0]}")
     
-    # Check for inf values
     inf_counts = np.isinf(df[required_features]).sum()
     if inf_counts.sum() > 0:
         logging.warning(f"Inf values found in features:\n{inf_counts[inf_counts > 0]}")
     
-    logging.info(f"✓ All {len(required_features)} features validated successfully")
+    logging.info(f"✅ All {len(required_features)} features validated successfully")
     return True
 
 def main():
@@ -389,18 +401,24 @@ def main():
         prepared_df = prepare_indicators(m5df, h1df)
         
         print(f"\nPrepared data: {len(prepared_df)} candles with {len(prepared_df.columns)} columns")
-        print(f"\nFeatures: {list(prepared_df.columns)}")
+        print(f"\nAll features ({len(prepared_df.columns)} total):")
+        print(list(prepared_df.columns))
         
         # Validate
         try:
             validate_feature_set(prepared_df)
-            print("\n✓ Feature set validation PASSED")
+            print("\n✅ Feature set validation PASSED")
         except ValueError as e:
-            print(f"\n✗ Feature set validation FAILED: {e}")
+            print(f"\n❌ Feature set validation FAILED: {e}")
         
         # Show sample
         print(f"\nSample data (last 5 rows):")
         print(prepared_df.tail())
+        
+        # Show normalized vs original comparison
+        print(f"\n📊 Normalization Sample (Close vs Close_Z):")
+        comparison = prepared_df[['Close', 'Close_Z']].tail(10)
+        print(comparison)
     else:
         print("Failed to fetch data")
 

@@ -43,54 +43,59 @@ class TradingEnv(gym.Env):
     def __init__(self, df, phase=1):
         """
         Initialize the trading environment with curriculum learning support.
+        Uses NORMALIZED features for LSTM input while keeping original OHLC for trading logic.
         
         Args:
-            df: DataFrame with market data
+            df: DataFrame with market data (39 features)
             phase: Curriculum phase (1, 2, or 3)
-                   Phase 1: Direction Learning (Win Rate)
-                   Phase 2: R:R Strategy Learning
-                   Phase 3: Full Risk Management
         """
         super(TradingEnv, self).__init__()
         self.df = df.copy()
         self.lookback_window = config.RL_LOOKBACK_WINDOW
         
-        # Curriculum Phase
         self.phase = phase
         _logger.info(f"Initializing TradingEnv with Phase {self.phase}")
 
-        # FULL FEATURE SET - matches your requirement
+        # NORMALIZED FEATURES for LSTM (22 features total)
+        # These are what the model sees - all normalized/z-scored
         self.feature_columns = [
-            'Open', 'High', 'Low', 'Close', 'Volume', 'ATR', 'RSI', 'MACD_line', 'MACD_hist',
-            'ADX', 'stoch_k', 'stoch_d', 'upper_wick', 'lower_wick', 'body_size', 'H1_Close', 'H1_EMA',
-            'H1_RSI', 'H1_ADX', 'RSI_Z', 'MACD_line_Z', 'MACD_hist_Z', 'ADX_Z', 'stoch_k_Z', 'stoch_d_Z',
-            'upper_wick_Z', 'lower_wick_Z', 'body_size_Z', 'H1_RSI_Z', 'H1_ADX_Z', 'hour_sin', 'hour_cos',
-            'day_sin', 'day_cos'
+            # Z-scored OHLCV (5)
+            'Open_Z', 'High_Z', 'Low_Z', 'Close_Z', 'Volume_Z',
+            # Time features (4) - already normalized
+            'hour_sin', 'hour_cos', 'day_sin', 'day_cos',
+            # Z-scored indicators (13)
+            'RSI_Z', 'MACD_line_Z', 'MACD_hist_Z', 'ADX_Z',
+            'stoch_k_Z', 'stoch_d_Z',
+            'upper_wick_Z', 'lower_wick_Z', 'body_size_Z',
+            'H1_Close_Z', 'H1_RSI_Z', 'H1_ADX_Z'
         ]
 
-        # Validate all columns exist in dataframe
+        # Validate normalized columns exist
         missing_cols = [col for col in self.feature_columns if col not in self.df.columns]
         if missing_cols:
-            raise ValueError(f"Missing required columns in dataframe: {missing_cols}")
+            raise ValueError(f"Missing required normalized columns: {missing_cols}")
 
-        # Pre-compute and cache arrays for better performance
+        # Pre-compute and cache arrays
+        # LSTM sees normalized features
         self.features_array = self.df[self.feature_columns].astype(np.float64).values
+        
+        # Trading logic uses ORIGINAL prices
         self.open_prices = self.df['Open'].astype(np.float64).values
         self.high_prices = self.df['High'].astype(np.float64).values
         self.low_prices = self.df['Low'].astype(np.float64).values
         self.close_prices = self.df['Close'].astype(np.float64).values
         self.atr_values = self.df['ATR'].astype(np.float64).values
 
-        # Action space: ALWAYS (direction, rr_profile, risk_level) - UNCHANGED across phases
+        # Action space unchanged
         self.action_space = spaces.MultiDiscrete([
             3,  # 0=BUY, 1=SELL, 2=HOLD
-            len(config.RR_PROFILES),  # RR Profile index
-            len(config.RISK_LEVELS)   # Risk Level index
+            len(config.RR_PROFILES),
+            len(config.RISK_LEVELS)
         ])
 
         market_features_shape = (self.lookback_window, len(self.feature_columns))
 
-        # Observation space - UNCHANGED across phases
+        # Observation space - normalized features only
         self.observation_space = spaces.Dict({
             'market_features': spaces.Box(
                 low=-np.inf, high=np.inf,
@@ -105,7 +110,6 @@ class TradingEnv(gym.Env):
         self.action_usage_counts = {}
         self.recent_returns = deque(maxlen=self.lookback_window)
 
-        # Efficient tracking for rewards
         self.win_history = deque(maxlen=config.REWARD_METRIC_WINDOW)
         self.rr_history = deque(maxlen=config.REWARD_METRIC_WINDOW)
         self.risk_history = deque(maxlen=config.REWARD_METRIC_WINDOW)
@@ -114,14 +118,11 @@ class TradingEnv(gym.Env):
         self._last_current_equity = config.INITIAL_EQUITY
 
         self.reset()
+        
+        _logger.info(f"✅ Environment initialized with {len(self.feature_columns)} NORMALIZED features for LSTM")
 
     def set_phase(self, phase_id):
-        """
-        Change the curriculum phase at runtime.
-        
-        Args:
-            phase_id: Integer 1, 2, or 3
-        """
+        """Change the curriculum phase at runtime."""
         if phase_id not in [1, 2, 3]:
             raise ValueError(f"Invalid phase_id {phase_id}. Must be 1, 2, or 3.")
         
@@ -140,7 +141,6 @@ class TradingEnv(gym.Env):
         self._last_floating_pnl = 0.0
         self._last_current_equity = float(config.INITIAL_EQUITY)
         
-        # Clear histories on reset
         self.win_history.clear()
         self.rr_history.clear()
         self.risk_history.clear()
@@ -150,13 +150,13 @@ class TradingEnv(gym.Env):
         return obs, {}
 
     def _calculate_floating_pnl(self):
-        """Calculate unrealized P&L for open positions using lot-based system."""
+        """Calculate unrealized P&L using ORIGINAL prices."""
         if not self.open_positions:
             self._last_floating_pnl = 0.0
             return 0.0
 
         idx = max(0, min(len(self.close_prices) - 1, int(self.current_step - 1)))
-        current_price = safe_value(self.close_prices[idx], default=self.close_prices[idx] if len(self.close_prices) else 0.0)
+        current_price = safe_value(self.close_prices[idx])
 
         floating_pnl = 0.0
         for p in self.open_positions:
@@ -170,7 +170,7 @@ class TradingEnv(gym.Env):
             
             if p.get('type') == 'LONG':
                 pnl = (current_price - entry_price) * lot_size * contract_size
-            else:  # SHORT
+            else:
                 pnl = (entry_price - current_price) * lot_size * contract_size
             
             floating_pnl += float(np.clip(pnl, -_MAX_PNL, _MAX_PNL))
@@ -181,48 +181,29 @@ class TradingEnv(gym.Env):
 
     def _calculate_reward(self, total_pnl_closed_this_step=0, num_closed_trades=0, 
                           closed_positions=None, action=None):
-        """
-        Calculate reward based on curriculum phase.
-        
-        MODIFICATION: Includes a 'step_penalty' if the agent is inactive 
-        (no open positions and no trades closing) to force market participation.
-        """
-        # Define the penalty magnitude (Adjust this if needed)
-        # -0.1 is significant enough to accumulate to -100 over 1000 steps
+        """Calculate reward based on curriculum phase."""
         INACTIVITY_PENALTY = -0.05 
-        
-        # Check if the agent is currently "flat" (no exposure to market)
         is_flat = len(self.open_positions) == 0
         
-        # ---------------------------------------------------------------------
-        # PHASE 1: Direction Learning
-        # ---------------------------------------------------------------------
         if self.phase == 1:
             if num_closed_trades == 0:
-                # If we are flat and didn't close a trade, apply penalty
                 if is_flat:
                     return INACTIVITY_PENALTY
-                # If we are holding a position but it didn't close yet, neutral (or small time cost)
                 return 0.0
             
-            # Binary reward for each closed trade
             reward = 0.0
             if closed_positions:
                 for pos in closed_positions:
                     pnl = pos.get('realized_pnl', 0.0)
                     if pnl > 0:
-                        reward += 1.0  # Win
+                        reward += 1.0
                     elif pnl < 0:
-                        reward -= 1.0  # Loss
+                        reward -= 1.0
             
             return safe_value(reward, default=0.0, clip_min=-10.0, clip_max=10.0)
         
-        # ---------------------------------------------------------------------
-        # PHASE 2: R:R Strategy Learning
-        # ---------------------------------------------------------------------
         elif self.phase == 2:
             if num_closed_trades == 0:
-                # If we are flat and didn't close a trade, apply penalty
                 if is_flat:
                     return INACTIVITY_PENALTY
                 return 0.0
@@ -234,7 +215,6 @@ class TradingEnv(gym.Env):
                     risk_amount = pos.get('risk_amount', 1.0)
                     
                     if risk_amount > 0:
-                        # Normalize PnL by risk (R-multiple)
                         r_multiple = safe_div(pnl, risk_amount, default=0.0)
                         reward += r_multiple
                     else:
@@ -242,15 +222,10 @@ class TradingEnv(gym.Env):
             
             return safe_value(reward, default=0.0, clip_min=-10.0, clip_max=10.0)
         
-        # ---------------------------------------------------------------------
-        # PHASE 3: Full Risk Management
-        # ---------------------------------------------------------------------
         else: 
-            # 1. PnL Component (Normalized)
             pnl_norm = safe_div(total_pnl_closed_this_step, max(self._last_current_equity, 1.0), default=0.0)
             r_pnl = safe_value(pnl_norm, default=0.0, clip_min=-1.0, clip_max=1.0)
 
-            # 2. Drawdown Component
             current_equity = safe_value(self._last_current_equity, default=self.equity)
             if self.peak_equity <= 0:
                 drawdown = 0.0
@@ -258,12 +233,10 @@ class TradingEnv(gym.Env):
                 drawdown = max(0.0, safe_div((self.peak_equity - current_equity), self.peak_equity, default=0.0))
             r_drawdown = -(drawdown ** 2)
 
-            # 3. Win Rate Component
             r_winrate = 0.0
             if num_closed_trades > 0 and len(self.win_history) > 0:
                 r_winrate = sum(self.win_history) / len(self.win_history)
 
-            # 4. RR-PnL Component
             try:
                 _, risk_index, rr_profile_index = action
                 risk_index = int(np.clip(int(risk_index), 0, len(config.RISK_LEVELS) - 1))
@@ -284,36 +257,30 @@ class TradingEnv(gym.Env):
             except Exception:
                 rr_pnl = 0.0
 
-            # 5. Inactivity Penalty Component (New)
             r_inactivity = 0.0
             if num_closed_trades == 0 and is_flat:
                 r_inactivity = INACTIVITY_PENALTY
 
-            # Combine with Weights
             weights = config.REWARD_WEIGHTS
             
-            # Note: We add r_inactivity directly (unweighted) or you can add a weight for it in config
             reward = (
                 weights['pnl'] * r_pnl +
                 weights['drawdown'] * r_drawdown +
                 weights['winrate'] * r_winrate +
                 weights['rrpnl'] * rr_pnl +
-                r_inactivity  # Apply penalty
+                r_inactivity
             )
 
             return safe_value(reward, default=0.0, clip_min=-1e9, clip_max=1e9)
 
     def _update_portfolio(self):
-        """
-        Update portfolio by checking if SL or TP hit on existing positions.
-        Returns closed positions for reward calculation.
-        """
+        """Update portfolio using ORIGINAL prices."""
         if not self.open_positions:
             return 0.0, 0, []
 
         total_pnl = 0.0
         positions_to_close = []
-        closed_positions = []  # For reward calculation
+        closed_positions = []
 
         idx = max(0, min(len(self.close_prices) - 1, int(self.current_step - 1)))
         current_price = safe_value(self.close_prices[idx], default=0.0)
@@ -331,7 +298,6 @@ class TradingEnv(gym.Env):
                 continue
 
             if position.get('type') == 'LONG':
-                # Long Exit: Check SL/TP
                 if not np.isnan(sl) and self.low_prices[idx] <= sl + _EPS:
                     close_price = sl
                     pnl = (close_price - entry_price) * lot_size * contract_size
@@ -396,7 +362,6 @@ class TradingEnv(gym.Env):
             self.equity = float(np.clip(new_equity, -_MAX_PNL, _MAX_PNL))
             self.open_positions = [p for p in self.open_positions if p not in positions_to_close]
             
-            # Update metrics
             for p in positions_to_close:
                 exit_reason = p.get('exit_reason', 'UNKNOWN')
                 is_win = 1.0 if exit_reason == 'TP' else 0.0
@@ -416,41 +381,29 @@ class TradingEnv(gym.Env):
         return total_pnl, len(positions_to_close), closed_positions
 
     def _execute_action(self, action_type, risk_index, rr_profile_index):
-        """
-        Execute trading action with curriculum phase overrides.
-        
-        Phase 1: Override to use RR_PROFILES[0] and RISK_LEVELS[0]
-        Phase 2: Override to use RISK_LEVELS[0], respect agent's RR choice
-        Phase 3: Respect all agent choices
-        """
+        """Execute trading action using ORIGINAL prices."""
         try:
             action_type = int(action_type)
         except Exception:
             action_type = 0
         
-        # Original agent choices
         original_risk_index = int(np.clip(int(risk_index), 0, max(0, len(config.RISK_LEVELS) - 1)))
         original_rr_index = int(np.clip(int(rr_profile_index), 0, max(0, len(config.RR_PROFILES) - 1)))
         
-        # Apply curriculum phase overrides
         if self.phase == 1:
-            # Phase 1: Force simplest configuration
-            risk_index = 0  # Force lowest risk
-            rr_profile_index = 0  # Force simplest R:R
+            risk_index = 0
+            rr_profile_index = 0
             _logger.debug(f"Phase 1 Override: RR={rr_profile_index}, Risk={risk_index}")
         
         elif self.phase == 2:
-            # Phase 2: Force lowest risk, respect R:R choice
-            risk_index = 0  # Force lowest risk
-            rr_profile_index = original_rr_index  # Respect agent's R:R choice
+            risk_index = 0
+            rr_profile_index = original_rr_index
             _logger.debug(f"Phase 2 Override: Risk forced to 0, RR={rr_profile_index} (agent choice)")
         
-        else:  # Phase 3
-            # Phase 3: Full autonomy - respect all choices
+        else:
             risk_index = original_risk_index
             rr_profile_index = original_rr_index
         
-        # Continue with execution using (potentially overridden) values
         if (len(self.open_positions) >= config.MAX_POSITIONS_PER_SYMBOL or action_type == 2):
             if action_type == 2:
                 self.consecutive_holds += 1
@@ -483,7 +436,7 @@ class TradingEnv(gym.Env):
             tp = entry_price + (atr * tp_multiplier)
             pos_type = 'LONG'
             
-        else:  # SELL/SHORT (action_type == 1)
+        else:  # SELL/SHORT
             entry_price = current_open_price
             sl = entry_price + (atr * sl_multiplier)
             tp = entry_price - (atr * tp_multiplier)
@@ -493,7 +446,6 @@ class TradingEnv(gym.Env):
         stop_distance = max(stop_distance, _EPS)
 
         if stop_distance > 0 and self.equity > 0:
-            # Calculate risk amount for Phase 2 reward normalization
             risk_amount = self.equity * (risk_percent / 100.0)
             
             contract_size = getattr(config, 'CONTRACT_SIZE', 100000)
@@ -515,14 +467,14 @@ class TradingEnv(gym.Env):
                     'lot_size': float(lot_size),
                     'risk_level': int(risk_index),
                     'rr_profile_index': int(rr_profile_index),
-                    'risk_amount': float(risk_amount)  # Store for Phase 2 reward
+                    'risk_amount': float(risk_amount)
                 }
                 self.open_positions.append(new_position)
                 self._just_opened_trade = True
                 _logger.debug(f"Phase {self.phase} - Opened {pos_type}: {lot_size:.2f} lots, RR={rr_profile_index}, Risk={risk_index}")
 
     def _next_observation(self):
-        """Create observation from COMPLETED candles only."""
+        """Create observation from NORMALIZED features."""
         end = int(self.current_step)
         start = max(0, end - self.lookback_window)
 
@@ -548,24 +500,12 @@ class TradingEnv(gym.Env):
         return {'market_features': market_features_out.copy()}
 
     def step(self, action):
-        """
-        Execute one step with curriculum phase logic.
-        Action is ALWAYS parsed as [direction, rr_profile, risk_level]
-        but may be overridden internally based on phase.
-        
-        Phase 1: Does NOT terminate on negative equity (learning focus)
-        Phase 2-3: Terminates on negative equity (risk awareness)
-        """
-        # Phase-specific equity termination logic
+        """Execute one step with curriculum phase logic."""
         if self.phase == 1:
-            # Phase 1: Allow negative equity - focus on direction learning
-            # Don't terminate early, let agent learn from full episodes
             if self.equity <= 0:
-                # Reset equity to small amount to continue learning
-                self.equity = float(config.INITIAL_EQUITY * 0.1)  # 10% of initial
+                self.equity = float(config.INITIAL_EQUITY * 0.1)
                 _logger.debug(f"Phase 1: Equity reset to {self.equity:.2f} to continue learning")
         else:
-            # Phase 2 & 3: Terminate on bankruptcy
             if self.equity <= 0:
                 self.current_step += 1
                 obs = self._next_observation()
@@ -574,18 +514,15 @@ class TradingEnv(gym.Env):
         try:
             action_type, rr_index, risk_index = action
         except Exception:
-            action_type, rr_index, risk_index = 2, 0, 0  # Default to HOLD
+            action_type, rr_index, risk_index = 2, 0, 0
 
-        # Execute action (with potential phase overrides inside)
         self._execute_action(action_type, risk_index, rr_index)
 
         self.current_step += 1
         terminated = bool(self.current_step >= len(self.df))
 
-        # Update portfolio and get closed positions
         pnl_from_closed_trades, num_closed, closed_positions = self._update_portfolio()
         
-        # Calculate reward based on phase
         reward = self._calculate_reward(
             total_pnl_closed_this_step=pnl_from_closed_trades,
             num_closed_trades=num_closed,
@@ -596,7 +533,6 @@ class TradingEnv(gym.Env):
         if not np.isfinite(self.equity):
             self.equity = safe_value(self.equity, default=0.0)
         
-        # Phase 2 & 3: Apply termination penalty for bankruptcy
         if self.equity <= 0 and self.phase > 1:
             terminated = True
             reward += float(config.CONSTRAINT_VIOLATION_PENALTY)

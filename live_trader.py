@@ -330,30 +330,35 @@ class LiveTrader:
             self.logger.error(traceback.format_exc())
 
     def get_live_observation(self, df, open_positions, account_info, live_drawdown):
-        """Get observation for the model with FULL feature set - ALIGNED with environment."""
+        """Get observation for the model with NORMALIZED features - ALIGNED with environment."""
         try:
             lookback_df = df.iloc[-config.RL_LOOKBACK_WINDOW:]
 
-            # ✅ FULL FEATURE SET - matches environment and requirement
+            # ✅ NORMALIZED FEATURES for LSTM (22 features total)
+            # These match the environment's feature_columns exactly
             feature_columns = [
-                'Open', 'High', 'Low', 'Close', 'Volume', 'ATR', 'RSI', 'MACD_line', 'MACD_hist',
-                'ADX', 'stoch_k', 'stoch_d', 'upper_wick', 'lower_wick', 'body_size', 'H1_Close', 'H1_EMA',
-                'H1_RSI', 'H1_ADX', 'RSI_Z', 'MACD_line_Z', 'MACD_hist_Z', 'ADX_Z', 'stoch_k_Z', 'stoch_d_Z',
-                'upper_wick_Z', 'lower_wick_Z', 'body_size_Z', 'H1_RSI_Z', 'H1_ADX_Z', 'hour_sin', 'hour_cos',
-                'day_sin', 'day_cos'
+                # Z-scored OHLCV (5)
+                'Open_Z', 'High_Z', 'Low_Z', 'Close_Z', 'Volume_Z',
+                # Time features (4) - already normalized
+                'hour_sin', 'hour_cos', 'day_sin', 'day_cos',
+                # Z-scored indicators (13)
+                'RSI_Z', 'MACD_line_Z', 'MACD_hist_Z', 'ADX_Z',
+                'stoch_k_Z', 'stoch_d_Z',
+                'upper_wick_Z', 'lower_wick_Z', 'body_size_Z',
+                'H1_Close_Z', 'H1_RSI_Z', 'H1_ADX_Z'
             ]
 
             # Validate all columns exist
             missing_cols = [col for col in feature_columns if col not in lookback_df.columns]
             if missing_cols:
-                self.logger.error(f"Missing columns in dataframe: {missing_cols}")
+                self.logger.error(f"Missing normalized columns in dataframe: {missing_cols}")
                 return None
 
             features_df = lookback_df[feature_columns]
 
             # Fill NaNs exactly like environment
             if features_df.isnull().any().any():
-                self.logger.warning("NaN values found in features, filling with zeros")
+                self.logger.warning("NaN values found in normalized features, filling with zeros")
                 features_df = features_df.fillna(0)
 
             # Market features - exactly like environment format
@@ -371,6 +376,7 @@ class LiveTrader:
                 self.logger.error(f"Invalid market_features shape: {observation['market_features'].shape}, expected {expected_market_shape}")
                 return None
 
+            self.logger.debug(f"✅ Created observation with {len(feature_columns)} NORMALIZED features")
             return observation
 
         except Exception as e:
